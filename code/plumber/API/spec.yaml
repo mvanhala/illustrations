@@ -1,0 +1,253 @@
+openapi: 3.0.0
+info:
+  title: Auto models
+  description: Calculating auto policy premium
+  version: 1.0
+paths:
+  /AutoPremium:
+    post:
+      summary: Calculate auto policy premium
+      tags:
+      - name: French Auto Premium
+      requestBody:
+        description: Parameters for calculating premium
+        required: yes
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutoVars'
+      responses:
+        '200':
+          description: Calculated premiums
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponseAutoPolicy'
+        '400':
+          description: Bad request
+components:
+  schemas:
+    AutoVars:
+      type: object
+      properties:
+        PolNumber:
+          type: string
+          description: Policy number
+          example: 12345678
+        PolEffDate:
+          type: string
+          description: Policy effective date
+          example: '2021-01-01'
+          format: date
+        BonusMalus:
+          type: integer
+          description: Policy-level bonus/malus
+          example: 72
+        RiskVar:
+          type: integer
+          description: Policy-level risk variable
+          example: 15
+          enum:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+        Drivers:
+          type: array
+          description: Array of drivers
+          items:
+            $ref: '#/components/schemas/DriverVars'
+        Vehicles:
+          type: array
+          description: Array of vehicles
+          items:
+            $ref: '#/components/schemas/VehicleVars'
+    DriverVars:
+      type: object
+      properties:
+        DriverNum:
+          type: integer
+          description: Driver number
+          example: 1
+        Gender:
+          type: string
+          description: Gender
+          example: Male
+          enum:
+          - Male
+          - Female
+        MariStat:
+          type: string
+          description: Marital status
+          example: Alone
+          enum:
+          - Alone
+          - Other
+        Age:
+          type: integer
+          description: Driver age
+          example: 30
+        SocioCateg:
+          type: string
+          description: Socio-professional category
+          example: CSP50
+          enum:
+          - CSP1
+          - CSP26
+          - CSP37
+          - CSP42
+          - CSP46
+          - CSP48
+          - CSP50
+          - CSP55
+          - CSP60
+          - CSP66
+          - Other
+    VehicleVars:
+      type: object
+      properties:
+        VehicleNum:
+          type: integer
+          description: Vehicle number
+          example: 1
+        Age:
+          type: integer
+          description: Vehicle age in years
+          example: 2
+        Body:
+          type: string
+          description: Vehicle body
+          example: sedan
+          enum:
+          - bus
+          - cabriolet
+          - coupe
+          - microvan
+          - other microvan
+          - sedan
+          - sport utility vehicle
+          - station wagon
+          - van
+        Class:
+          type: string
+          description: Vehicle class
+          example: B
+          enum:
+          - '0'
+          - A
+          - B
+          - H
+          - M1
+          - M2
+        Energy:
+          type: string
+          description: Vehicle energy
+          example: regular
+          enum:
+          - diesel
+          - eletric
+          - GPL
+          - regular
+        Engine:
+          type: string
+          description: Vehicle engine
+          example: injection
+          enum:
+          - carburation
+          - direct injection overpowered
+          - electric
+          - GPL
+          - injection
+          - injection overpowered
+        Garage:
+          type: string
+          description: Garage location type
+          example: None
+          enum:
+          - Collective garage
+          - None
+          - Private garage
+        HasKmLimit:
+          type: string
+          description: Mileage limit?
+          example: 'No'
+          enum:
+          - 'Yes'
+          - 'No'
+        MaxSpeed:
+          type: integer
+          description: Maximum vehicle speed
+          example: 160
+        Usage:
+          type: string
+          description: Vehicle speed
+          example: Professional
+          enum:
+          - Private
+          - Private+trip to office
+          - Professional
+          - Professional run
+    ResponseAutoPolicy:
+      type: object
+      properties:
+        PolNumber:
+          type: string
+          description: Policy number
+          example: 12345678
+        PolEffDate:
+          type: string
+          description: Policy effective date
+          example: '2021-01-01'
+          format: date
+        PolicyPremium:
+          type: number
+          description: Total policy premium
+          example: 630.12
+        Vehicles:
+          type: array
+          description: Vehicle-level premiums
+          items:
+            $ref: '#/components/schemas/ResponseAutoVehicle'
+    ResponseAutoVehicle:
+      type: object
+      properties:
+        VehicleNum:
+          type: integer
+          description: Vehichle number
+          example: 1
+        VehiclePremium:
+          type: number
+          description: Vehicle premium
+          example: 257.51
+        Drivers:
+          type: array
+          description: Driver-level premium allocation
+          items:
+            $ref: '#/components/schemas/ResponseAutoDriver'
+    ResponseAutoDriver:
+      type: object
+      properties:
+        DriverNum:
+          type: integer
+          description: Driver number
+          example: 1
+        Premium:
+          type: number
+          description: Driver-allocated premium for vehicle
+          example: 154.24

@@ -1,0 +1,74 @@
+{
+  "PolNumber": 12345678,
+  "PolEffDate": "2021-01-01",
+  "BonusMalus": 72,
+  "RiskVar": 15,
+  "Drivers": [
+    {
+      "DriverNum": 1,
+      "Gender": "Female",
+      "MariStat": "Other",
+      "Age": 55,
+      "SocioCateg": "CSP1"
+    },
+    {
+      "DriverNum": 2,
+      "Gender": "Male",
+      "MariStat": "Alone",
+      "Age": 34,
+      "SocioCateg": "CSP55"
+    },
+    {
+      "DriverNum": 3,
+      "Gender": "Male",
+      "MariStat": "Other",
+      "Age": 32,
+      "SocioCateg": "CSP50"
+    },
+    {
+      "DriverNum": 4,
+      "Gender": "Female",
+      "MariStat": "Other",
+      "Age": 38,
+      "SocioCateg": "CSP55"
+    }
+  ],
+  "Vehicles": [
+    {
+      "VehicleNum": 1,
+      "Age": 2,
+      "Body": "sedan",
+      "Class": "B",
+      "Energy": "regular",
+      "Engine": "injection",
+      "Garage": "None",
+      "HasKmLimit": "No",
+      "MaxSpeed": 160,
+      "Usage": "Professional"
+    },
+    {
+      "VehicleNum": 2,
+      "Age": 1,
+      "Body": "other microvan",
+      "Class": "M1",
+      "Energy": "diesel",
+      "Engine": "direct injection overpowered",
+      "Garage": "Private garage",
+      "HasKmLimit": "No",
+      "MaxSpeed": 170,
+      "Usage": "Professional"
+    },
+    {
+      "VehicleNum": 3,
+      "Age": 6,
+      "Body": "cabriolet",
+      "Class": "M1",
+      "Energy": "regular",
+      "Engine": "injection",
+      "Garage": "Collective garage",
+      "HasKmLimit": "No",
+      "MaxSpeed": 170,
+      "Usage": "Private+trip to office"
+    }
+  ]
+}
