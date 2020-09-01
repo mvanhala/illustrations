@@ -1,0 +1,1102 @@
+---
+title: "Exploring metrics for evaluating and comparing models"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r packages, class.source = "fold-hide"}
+library(dplyr)
+library(ggplot2)
+set.seed(427)
+```
+
+# Introduction
+
+In fitting models, there are a number of different metrics one can try to 
+optimize (e.g., log likelihood, root mean squared error, mean absolute percent error).
+
+In this notebook we will look at three metrics for evaluating and comparing models.
+Our focus will be on regression problems, particularly heavily skewed insurance
+pricing data. Classification problems have commonly used metrics (e.g., precision, recall, 
+F-score, ROC curve) which are intuitive.
+
+We will focus on metrics with a flavor of intuitive application to the insurance model
+context, in comparison to some of the classic or standard metrics.
+
+In particular, we will examine three different metrics:
+
+1. Area under a Lorenz curve as a measure of directional segmentation
+
+2. Cramer-von Mises distance between the distributions of actual and predicted loss
+as a measure of quantitative model calibration
+
+3. Weighted variance of predictions as a measure of the degree of segmentation
+
+Each of these metrics has their advantages and disadvantages.
+In this notebook, we try to explain how they are calculated, what they are useful 
+for, and their limitations.
+
+
+# Simulated data
+
+## Example 1
+
+Let's consider the following. We'll simulate loss data for 1,000,000 policies,
+where losses are simulated from a Tweedie distribution in which the mean
+varies based on one attribute.
+
+```{r, class.source = "fold-show"}
+n <- 1000000
+
+data_sim_1 <- tibble(
+  id = 1:n,
+  x1 = rnorm(n),
+  x2 = rnorm(n),
+  loss = tweedie::rtweedie(n, p = 1.33, phi = 650, mu = exp(5 + 0.5 * x1)),
+  weight = 1
+)
+```
+
+We'll fit a GLM to the simulated data.
+
+```{r}
+fitted_model_1 <- glm(
+  loss ~ x1, 
+  data = data_sim_1, 
+  family = statmod::tweedie(var.power = 1.5, link.power = 0), 
+  model = FALSE,
+  y = FALSE
+)
+```
+
+Here are the estimated parameters from the fitted model. The true parameter
+values are 5 for the intercept and 0.5 for `x1`.
+
+```{r}
+coef(fitted_model_1)
+```
+
+Let's get the predicted values on the simulated data set.
+
+```{r}
+data_sim_pred_1 <- data_sim_1 %>%
+  mutate(
+    predict = exp(coef(fitted_model_1)[1] + coef(fitted_model_1)[2] * x1)
+  )
+```
+
+## Example 2
+
+We'll simulate another data set, this time for 50,000 policies. As before,
+we'll fit a GLM and get predicted values.
+
+```{r}
+n <- 50000
+
+data_sim_2 <- tibble(
+  id = 1:n,
+  x1 = rnorm(n),
+  loss = tweedie::rtweedie(n, p = 1.33, phi = 650, mu = exp(0.2 + 0.5 * x1)),
+  weight = 1
+)
+
+fitted_model_2 <- glm(
+  loss ~ x1, 
+  data = data_sim_2, 
+  family = statmod::tweedie(var.power = 1.5, link.power = 0), 
+  model = FALSE,
+  y = FALSE
+)
+
+data_sim_pred_2 <- data_sim_2 %>%
+  mutate(
+    predict = exp(coef(fitted_model_2)[1] + coef(fitted_model_2)[2] * x1)
+  )
+```
+
+
+# Lorenz curve
+
+The Lorenz curve is useful as a measure of the quality of directional segmentation
+created by a model.
+
+To compute a Lorenz curve, we do the following.
+
+1. Get the predicted values for all observations.
+2. Sort observations by predicted in decreasing order.
+3. Calculate two new columns: a column with the cumulative percentage of
+exposure, and a column with the cumulative percentage of actual loss.
+
+Here is some sample code for computing a Lorenz curve.
+
+```{r, class.source = "fold-show"}
+calc_lorenz_curve <- function(data, pred_col, tgt_x_wgt_col, wgt_col) {
+  pred_col <- sym(pred_col)
+  tgt_x_wgt_col <- sym(tgt_x_wgt_col)
+  wgt_col <- sym(wgt_col)
+  
+  by_pred <- data %>%
+    dtplyr::lazy_dt() %>%
+    group_by(!!pred_col) %>%
+    summarise(.wgt = sum(!!wgt_col), .tgt_x_wgt = sum(!!tgt_x_wgt_col)) %>%
+    arrange(desc(!!pred_col)) %>%
+    mutate(
+      cum_pct_wgt = cumsum(.wgt) / sum(.wgt),
+      cum_pct_tgt = cumsum(.tgt_x_wgt) / sum(.tgt_x_wgt)
+    ) %>%
+    select(cum_pct_wgt, cum_pct_tgt) %>%
+    data.table::as.data.table()
+  
+  initial_row <- data.table::data.table(cum_pct_wgt = 0, cum_pct_tgt = 0)
+  
+  dplyr::bind_rows(initial_row, by_pred)
+}
+```
+
+Let's calculate the Lorenz curve for the first sample simulated model fit above.
+
+```{r}
+sim_lorenz_curve <- calc_lorenz_curve(
+  data_sim_pred_1, 
+  "predict",
+  "loss",
+  "weight"
+)
+```
+
+Let's look at a few sample rows.
+
+```{r}
+sim_lorenz_curve %>%
+  as_tibble() %>%
+  slice(
+    c(1:3, 
+      round(seq(1000, n() - 1000, length.out = 20)), 
+      (n() - 2):n()
+    )
+  ) %>%
+  print(n = Inf)
+```
+
+## Plotting Lorenz curves
+
+In plotting a Lorenz curve, we plot the cumulative percentage of exposure on
+the x-axis and the cumulative percentage of loss on the y-axis.
+
+The following function will help us plot Lorenz curves.
+
+```{r}
+plot_dist_curve <- function(curve, 
+                            tgt_col,
+                            wgt_col,
+                            grp_col = NULL, 
+                            title = NULL) {
+  curve <- curve %>%
+    as_tibble() %>%
+    group_by_at(grp_col) %>%
+    filter(
+      !!sym(tgt_col) != lag(!!sym(tgt_col), default = -Inf) |
+        !!sym(tgt_col) != lead(!!sym(tgt_col), default = Inf)
+    ) %>%
+    ungroup()
+  
+  plot <- ggplot2::ggplot() +
+    ggplot2::theme_minimal()
+  
+  if (!is.null(grp_col)) {
+    plot <- plot + 
+      ggplot2::geom_segment(
+        ggplot2::aes(x = 0, y = 0, xend = 1, yend = 1), 
+        color = "black",
+        size = 1.2
+      ) +
+      ggplot2::geom_line(
+        data = curve,
+        aes(x = !!sym(wgt_col), y = !!sym(tgt_col), color = !!sym(grp_col)),
+        size = 1.2
+      ) +
+      scale_color_manual(values = pals::glasbey(length(unique(curve[[grp_col]]))))
+  } else {
+    plot <- plot + 
+      ggplot2::geom_segment(
+        ggplot2::aes(x = 0, y = 0, xend = 1, yend = 1), 
+        color = "red",
+        size = 1.2
+      ) +
+      ggplot2::geom_line(
+        data = curve, 
+        aes(x = !!sym(wgt_col), y = !!sym(tgt_col)),
+        size = 1.2
+      )
+    
+  }
+  
+  plot +
+    ggplot2::theme(
+      legend.title = ggplot2::element_blank()
+    ) + 
+    ggplot2::ggtitle(title)
+}
+```
+
+Here is a Lorenz for the sample simulated model fit above. The black curve
+is the Lorenz curve and the red line is the 45-degree line of equality. 
+A model with no predictive power will have a Lorenz curve that bounces
+around the line of equality.
+
+```{r}
+plot_dist_curve(
+  sim_lorenz_curve, 
+  tgt_col = "cum_pct_tgt", 
+  wgt_col = "cum_pct_wgt", 
+  title = "Lorenz curve for sample simulated model"
+) +
+  xlab("Cumulative % exposure") + 
+  ylab("Cumulative % loss")
+```
+
+
+The better the model the predicts, the faster the curve will rise. In the 
+case of perfect segmentation, the curve would shoot up straight to 1 as rapidly
+as possible.
+
+Let's compare three sample Lorenz curves. In this, the curve for Model 2 is always
+above Model 1, so Model 2 dominates Model 1 with respect to directional segmentation.
+Model 3 neither universally dominates nor is dominated by Models 1 and 2, as there
+are points at which Model 3 is above the curves for Models 1 and 2 along with points
+at which Model 3 is below the curves for Models 1 and 2.
+
+```{r}
+sample_lorenz_compare <- tibble(
+  pct_expo = seq(0, 1, by = 0.05),
+  `Model 1` = (pct_expo) ^ (1/ 2),
+  `Model 2` = (pct_expo) ^ (1/ 3),
+  `Model 3` = .75 / .4 * pmin(pct_expo, 0.4) + .25 / .6 * pmax(0, pct_expo - 0.4)
+)
+
+plot_dist_curve(
+  sample_lorenz_compare %>%
+    tidyr::pivot_longer(
+      c(starts_with("Model")), 
+      names_to = "grp", 
+      values_to = "pct_tgt"
+    ), 
+  tgt_col = "pct_tgt", 
+  wgt_col = "pct_expo", 
+  grp_col = "grp",
+  title = "Sample Lorenz curves"
+) +
+  xlab("Cumulative % exposure") + 
+  ylab("Cumulative % loss")
+```
+
+## Summarizing a Lorenz curve: area under the curve
+
+A model providing better segmentation is characterized by having a higher
+and more steeply rising Lorenz curve. If you have two Lorenz curves
+and one curve is greater than or equal to the other at all points, then
+that higher one dominates the other.
+
+We can summarize a Lorenz curve into a scalar metric, namely, the area under the curve.
+The greater the area under the Lorenz curve, the better the model segmentation.
+
+The following function will compute the area under a Lorenz curve using the 
+trapezoidal method for numerical integration.
+
+```{r}
+calc_lorenz_auc <- function(curve, tgt_col = "cum_pct_tgt", wgt_col = "cum_pct_wgt") {
+  tgt_col <- sym(tgt_col)
+  wgt_col <- sym(wgt_col)
+  curve %>%
+    dtplyr::lazy_dt() %>%
+    dplyr::mutate(
+      xdiff = !!wgt_col - dplyr::lag(!!wgt_col, default = 0),
+      area = xdiff * (!!tgt_col + dplyr::lag(!!tgt_col, default = 0))/2
+    ) %>% 
+    summarise(auc = sum(area)) %>%
+    as_tibble() %>%
+    pull(auc)
+}
+```
+
+Here we invoke this function to compute the area under the Lorenz curve for the sample
+simulated model.
+
+```{r}
+calc_lorenz_auc(sim_lorenz_curve)
+```
+
+Let's calculate the area under the Lorenz curves for the three sample
+curves we looked at above. Model 2 has the greater area under the curve,
+followed by Model 3 and then Model 2.
+
+```{r}
+calc_lorenz_auc(sample_lorenz_compare, "Model 1", "pct_expo")
+calc_lorenz_auc(sample_lorenz_compare, "Model 2", "pct_expo")
+calc_lorenz_auc(sample_lorenz_compare, "Model 3", "pct_expo")
+```
+
+## Note about definitions
+
+Lorenz curves are often calculated by sorting predicted values in increasing
+order. In that case, one would desire the curve the stay as low as possible until
+the end, when it would rapidly rise to 1. The Gini coefficient is typically defined
+as twice the area between the Lorenz curve and the 45-degree line of equality.
+
+## Limitations to Lorenz curves
+
+The primary limitation to Lorenz curves is that they only measure the 
+rank-order quality of segmentation.
+
+Lorenz curves are invariant to monotonic transformations of the predicted values.
+If two sets of predictions have the same rank ordering of values, they will
+have identical Lorenz curves.
+
+Consider the following simple example of ten observations. There are three different
+models with predicted losses.
+
+```{r}
+simple_example <- tribble(
+  ~predict_1, ~predict_2, ~predict_3, ~actual_loss,
+  2500,       150,        100,        100,         
+  2600,       350,        200,        400,         
+  2700,       1000,       300,        1200,        
+  2800,       1100,       400,        800,         
+  2900,       1550,       500,        1500,        
+  3000,       2100,       600,        2000,        
+  3100,       3700,       700,        4300,        
+  3200,       4000,       800,        3000,        
+  3300,       6000,       8000,       6200,        
+  3400,       9500,       18000,      9600
+) %>%
+  mutate(weight = 1)
+
+simple_example
+```
+
+Each of the three sets of predicted values have the same rank ordering
+of predicted values, and therefore have the same Lorenz curves.
+
+```{r}
+simple_lorenz_1 <- calc_lorenz_curve(simple_example, "predict_1", "actual_loss", "weight")
+simple_lorenz_2 <- calc_lorenz_curve(simple_example, "predict_2", "actual_loss", "weight")
+simple_lorenz_3 <- calc_lorenz_curve(simple_example, "predict_3", "actual_loss", "weight")
+
+simple_lorenz <- bind_rows(
+  simple_lorenz_1 %>%
+    as_tibble() %>%
+    mutate(model = "Model 1"),
+  simple_lorenz_2 %>%
+    as_tibble() %>%
+    mutate(model = "Model 2"),
+  simple_lorenz_3 %>%
+    as_tibble() %>%
+    mutate(model = "Model 3")
+)
+
+plot_dist_curve(
+  simple_lorenz, 
+  "cum_pct_tgt", 
+  "cum_pct_wgt", 
+  "model", 
+  title = "Lorenz curves for simple example"
+) +
+  xlab("Cumulative % exposure") + 
+  ylab("Cumulative % loss")
+```
+
+However, let's plot the numeric values themselves for the predicted and actual losses of
+these observations.
+
+We see that Models 1 and 3 do not fit the distribution of actual losses well.
+
+Model 1 has too flat of a slope. It overpredicts for the lower observations and 
+underpredicts the higher observations. Model 3 is too steep.
+It underpredicts the lower observations and overpredicts the higher observations.
+By contrast, Model 2 fits much better. The actual and predicted values are in much closer
+agreement.
+
+```{r}
+ggplot(
+  data = simple_example %>%
+    rename(
+      `Model 1` = predict_1,
+      `Model 2` = predict_2,
+      `Model 3` = predict_3,
+      Actual = actual_loss
+    ) %>%
+    mutate(obs_num = 1:n()) %>%
+    tidyr::pivot_longer(
+      c(starts_with("Model"), Actual),
+      names_to = "model", 
+      values_to = "amount"
+    )
+) +
+  theme_minimal() + 
+  geom_bar(
+    aes(x = obs_num, y = amount, fill = model), 
+    stat = "identity",
+    position = "dodge"
+  ) +
+  theme(legend.title = element_blank()) + 
+  scale_y_continuous("Amount", labels = scales::comma) + 
+  scale_x_continuous(NULL, breaks = 1:10) +
+  scale_fill_manual(values = pals::glasbey(4)) +
+  ggtitle(
+    "Actual vs predicted loss by observation",
+    subtitle = "For simple example"
+  )
+```
+
+Thus, even though all three models had the exact same Lorenz curves,
+since they had the same rank ordering of predicted values,
+there were major differences in how well the predicted distribution of
+losses matched the actual distribution of losses.
+
+# Distance between predicted and actual distributions
+
+The limitation in Lorenz curves motivates our next metric for comparing
+the performance of a model.
+
+This metric is the distance between the predicted and actual distributions
+of losses.
+
+The distribution distance is useful as a measure how well-calibrated the
+predicted distribution is to the actual distribution.
+
+To compute a distribution comparison curve, we do the following.
+
+1. Get the predicted values for all observations.
+2. Sort observations by predicted value in ascending order.
+3. Calculate two new columns: a column with the cumulative percentage of
+predict loss, and a column with the cumulative percentage of actual loss.
+
+The idea behind the distribution comparison curve is that 
+if our model predicts $x\%$ of the total predicted loss to occur in a subset
+of observations, we would want $x\%$ of the total actual loss to occur 
+within that subset of observations.
+
+Here is some sample code for computing a distribution comparison curve.
+
+```{r}
+calc_prem_dist_curve <- function(data, pred_col, tgt_col, wgt_col) {
+  initial_row <- data.table::data.table(cum_pct_pred = 0, cum_pct_tgt = 0)
+  
+  curve <- data %>%
+    as_tibble() %>%
+    select(tgt = !!sym(tgt_col), pred = !!sym(pred_col), wgt = !!sym(wgt_col)) %>%
+    arrange(pred) %>%
+    transmute(
+      cum_pct_pred = cumsum(wgt * pred) / sum(wgt * pred), 
+      cum_pct_tgt = cumsum(tgt) / sum(tgt)
+    )
+  bind_rows(initial_row, curve)
+}
+```
+
+
+Let's calculate the distribution comparison curve for the second sample simulated model above.
+
+```{r}
+sim_dist_curve <- calc_prem_dist_curve(
+  data_sim_pred_2, 
+  "predict",
+  "loss",
+  "weight"
+)
+```
+
+Let's look at a few sample rows.
+
+```{r}
+sim_dist_curve %>%
+  as_tibble() %>%
+  slice(
+    c(1:3, 
+      round(seq(1000, n() - 1000, length.out = 20)), 
+      (n() - 2):n()
+    )
+  ) %>%
+  mutate_all(~round(., 6)) %>%
+  print(n = Inf)
+```
+
+## Plotting distribution comparison curves
+
+In plotting a Lorenz curve, we plot the cumulative percentage of exposure on
+the x-axis and the cumulative percentage of loss on the y-axis.
+
+The function we saw above for plotting Lorenz curves can also be used 
+for plotting distribution comparison curves.
+
+
+```{r}
+plot_dist_curve(
+  sim_dist_curve, 
+  tgt_col = "cum_pct_tgt", 
+  wgt_col = "cum_pct_pred", 
+  title = "Distribution comparison curve for sample FP model"
+) +
+  xlab("Cumulative % predicted loss") + 
+  ylab("Cumulative % actual loss")
+```
+
+The black line is the line of actual vs. predicted cumulative loss. The red
+45-degree line is the line where the cumulative percentages of actual and 
+predicted loss are equal.
+
+Points on the graph can be read off in the following way. If there is a point
+at (25%, 30%), that means if you take the observations comprising 25% of total
+predicted loss (starting with the smallest predicted loss and summing up),
+those observations have a total of 30% of the total actual loss.
+
+## Summarizing a distribution comparison curve: Cramer-von Mises distance
+
+If the distribution of predicted loss is calibrated well to the distribution
+of actual loss, we would see the curve of actual vs. predicted loss be close 
+to the 45-degree line. Larger departures from the line of equality indicate
+poorer fits between the predicted and actual distributions.
+
+To summarize how well the predicted distribution fits the actual distribution
+into a scalar metric/statistic, we call to mind measures of the distance
+between two distribution functions.
+
+One of these is the Cramer-von Mises criterion, which is the integral of the square
+of the difference between the two distribution functions.
+
+Other common measures of distance between distributions are:
+
+* Anderson-Darling: a generalized version of the Cramer-von Mises statistic, where 
+there is a weighting function that can vary over the distribution. The Cramer-von Mises
+statistic is Anderson-Darling where the weight is constant.
+
+* Kolmogorov-Smirnov: the maximum distance between the two distribution functions
+
+* Wasserstein distance: the integral of the absolute value of the difference
+between the distribution functions
+
+* Kuiper distance: the sum of absolute values of the maximum positive distance 
+between the distribution functions and the maximum negative distance between the
+distribution functions (i.e., $\max\left(F_1(x)-F_2(x)\right)+\max\left(F_2(x) -F_1(x) \right)$).
+
+The following function will compute the Cramer-von Mises distance for a distribution 
+comparison curve.
+
+```{r}
+calc_prem_cvm <- function(curve, pred_col = "cum_pct_pred", tgt_col = "cum_pct_tgt") {
+  pred_col <- sym(pred_col)
+  tgt_col <- sym(tgt_col)
+  curve %>%
+    as_tibble() %>%
+    mutate(
+      xdiff = !!pred_col - dplyr::lag(!!pred_col, default = 0),
+      value = (!!tgt_col + dplyr::lag(!!tgt_col, default = 0)) / 2,
+      sq_diff = (!!pred_col - value) ^ 2
+    ) %>%
+    summarise(distance = sum(xdiff * sq_diff)) %>%
+    pull(distance)
+}
+
+```
+
+Here we calculate the Cramer-von Mises distance between the predicted and actual loss 
+distributions for the simulated model example.
+
+```{r}
+calc_prem_cvm(sim_dist_curve)
+```
+
+## Comparative example
+
+Let's consider the following. We'll use the data from the first simulated example.
+
+Now let's consider three different sets of predictions. The first will be the 
+those from the fitted model. The second will have the true intercept but a coefficient
+of `x1` that is too small, and the third will have a coefficient of `x1` that is
+too large.
+
+```{r}
+data_sim_pred_compare <- data_sim_1 %>%
+  mutate(
+    predict_1 = exp(coef(fitted_model_1)[1] + coef(fitted_model_1)[2] * x1),
+    predict_2 = exp(5 + 0.05 * x1),
+    predict_3 = exp(5 + x1)
+  )
+```
+
+First let's compare the predicted and actual values across a range of `x1` from -2 to 2,
+where the bulk of the distribution lies.
+
+We see that Model 1 is very close to the actual values, while Model 2 has a slope
+that is too flat (overpredicting for low `x1` and underpredicting for high `x1`),
+and Model 3 has a slope that is too steep (underpredicting for low `x1` and 
+overpredicting for high `x1`).
+
+```{r}
+data_sim_compare <- tibble(
+  x1 = seq(-2, 2, by = 0.01),
+  `Model 1` = exp(coef(fitted_model_1)[1] + coef(fitted_model_1)[2] * x1),
+  `Model 2` = exp(5 + 0.05 * x1),
+  `Model 3` = exp(5 + x1),
+  Actual = exp(5 + 0.5 * x1)
+) %>%
+  tidyr::pivot_longer(
+    c(starts_with("Model"), Actual),
+    names_to = "model", 
+    values_to = "value"
+  )
+
+ggplot(data = data_sim_compare) + 
+  theme_minimal() + 
+  geom_line(
+    aes(x = x1, y = value, color = model), 
+    size = 1.2, 
+    alpha = 0.75
+  ) + 
+  scale_color_manual(values = pals::glasbey(4)) +
+  theme(
+    legend.title = element_blank(), 
+    axis.title.y = element_blank()
+  ) +
+  ggtitle("Actual and predicted values by x1")
+```
+
+Let's see the Lorenz curves for these three sets of predictions.
+As in the simple example, the three sets of predictions all have the same rank ordering
+of predicted values, so their Lorenz curves are identical.
+
+```{r}
+sim_lorenz_1 <- calc_lorenz_curve(data_sim_pred_compare, "predict_1", "loss", "weight")
+sim_lorenz_2 <- calc_lorenz_curve(data_sim_pred_compare, "predict_2", "loss", "weight")
+sim_lorenz_3 <- calc_lorenz_curve(data_sim_pred_compare, "predict_3", "loss", "weight")
+
+sim_lorenz <- bind_rows(
+  sim_lorenz_1 %>%
+    as_tibble() %>%
+    mutate(model = "Model 1"),
+  sim_lorenz_2 %>%
+    as_tibble() %>%
+    mutate(model = "Model 2"),
+  sim_lorenz_3 %>%
+    as_tibble() %>%
+    mutate(model = "Model 3")
+)
+
+plot_dist_curve(
+  sim_lorenz, 
+  "cum_pct_tgt", 
+  "cum_pct_wgt", 
+  "model", 
+  title = "Lorenz curves for simulated example"
+) +
+  xlab("Cumulative % exposure") + 
+  ylab("Cumulative % loss")
+```
+
+Now let's look at the distribution comparison curves for these three predictions.
+
+We see that the curve for Model 1, which fit well, is almost entirely on top of the 
+45-degree line of equality.
+
+The curve Model 2, which had too flat of a slope (overpredicting for lower loss and
+underpredicting for higher loss) lies below the line of equality, while the curve for
+Model 3, which had too steep of a slope (underpredicting for lower loss and overpredicting
+for higher loss) lies above the line of equality.
+
+```{r}
+sim_dist_curve_1 <- calc_prem_dist_curve(data_sim_pred_compare, "predict_1", "loss", "weight")
+sim_dist_curve_2 <- calc_prem_dist_curve(data_sim_pred_compare, "predict_2", "loss", "weight")
+sim_dist_curve_3 <- calc_prem_dist_curve(data_sim_pred_compare, "predict_3", "loss", "weight")
+
+sim_dist_curve <- bind_rows(
+  sim_dist_curve_1 %>%
+    as_tibble() %>%
+    mutate(model = "Model 1"),
+  sim_dist_curve_2 %>%
+    as_tibble() %>%
+    mutate(model = "Model 2"),
+  sim_dist_curve_3 %>%
+    as_tibble() %>%
+    mutate(model = "Model 3")
+)
+
+plot_dist_curve(
+  sim_dist_curve, 
+  tgt_col = "cum_pct_tgt", 
+  wgt_col = "cum_pct_pred", 
+  "model", 
+  title = "Distribution comparison curves for simulated example"
+) +
+  xlab("Cumulative % predicted loss") + 
+  ylab("Cumulative % actual loss")
+```
+
+Let's calculate the Cramer-von Mises statistic for these predictions.
+
+We see that Model 1 has the lowest Cramer-von Mises statistic, indicating
+the best fit between predicted and actual losses.
+
+```{r}
+calc_prem_cvm(sim_dist_curve_1)
+calc_prem_cvm(sim_dist_curve_2)
+calc_prem_cvm(sim_dist_curve_3)
+```
+
+## Limitation/pitfall of distribution curves
+
+There is an important limitation/pitfall to keep in mind when using 
+this type of distribution curve.
+
+If the predicted values are completely random and have no relationship
+to the actual values, the distribution comparison curve will generally
+hug very close to the line of equality!
+
+For example, let's create another prediction for the simulated Tweedie example,
+where this is just a random draw from a scaled uniform distribution.
+
+```{r}
+data_sim_pred_random <- data_sim_pred_compare %>%
+  mutate(predict_random = runif(n(), min = 165, max = 170))
+
+dist_curve_random <- calc_prem_dist_curve(
+  data_sim_pred_random, 
+  "predict_random", 
+  "loss", 
+  "weight"
+)
+
+plot_dist_curve(
+  dist_curve_random, 
+  "cum_pct_tgt", 
+  "cum_pct_pred", 
+  title = "Distribution comparison curve for random predictions"
+) +
+  xlab("Cumulative % predicted loss") + 
+  ylab("Cumulative % actual loss")
+```
+
+We see that the curve lies almost very close to the line of equality.
+
+Calculating the Cramer-von Mises distance, we get a very small value.
+
+```{r}
+calc_prem_cvm(dist_curve_random)
+```
+
+However, this situation can be identified through the Lorenz curve.
+
+We see the Lorenz curve virtually on top of the line of equality and an
+area under the curve of around 0.5, indicating zero value to this 
+set of predictions.
+
+```{r}
+lorenz_curve_random <- calc_lorenz_curve(
+  data_sim_pred_random, 
+  "predict_random", 
+  "loss", 
+  "weight"
+)
+
+plot_dist_curve(
+  lorenz_curve_random, 
+  "cum_pct_tgt", 
+  "cum_pct_wgt", 
+  title = "Lorenz curve for random predictions"
+) +
+  xlab("Cumulative % exposure") + 
+  ylab("Cumulative % actual loss")
+
+calc_lorenz_auc(lorenz_curve_random)
+```
+
+## Revisiting simple example
+
+Let's return to the simple example we looked at at the end of the Lorenz curve section.
+
+We see the curve for Model 2, which was the best fit to actual, is close to the 
+line of equality. By comparison, the curve for Model 1, which is too flat
+(overpredicting lower loss and underpredicting higher loss), is below the line of
+equality, while the curve for Model 3, which is too steep (underpredicting lower loss
+and overpredicting higher loss) is above the line of equality, the same 
+relationship we saw in the case of the simulated data example.
+
+```{r}
+simple_dist_1 <- calc_prem_dist_curve(simple_example, "predict_1", "actual_loss", "weight")
+simple_dist_2 <- calc_prem_dist_curve(simple_example, "predict_2", "actual_loss", "weight")
+simple_dist_3 <- calc_prem_dist_curve(simple_example, "predict_3", "actual_loss", "weight")
+
+simple_dist <- bind_rows(
+  simple_dist_1 %>%
+    as_tibble() %>%
+    mutate(model = "Model 1"),
+  simple_dist_2 %>%
+    as_tibble() %>%
+    mutate(model = "Model 2"),
+  simple_dist_3 %>%
+    as_tibble() %>%
+    mutate(model = "Model 3")
+)
+
+plot_dist_curve(
+  simple_dist, 
+  "cum_pct_tgt", 
+  "cum_pct_pred", 
+  "model", 
+  title = "Distribution comparison curves for simple example"
+) +
+  xlab("Cumulative % predicted loss") + 
+  ylab("Cumulative % actual loss")
+```
+
+
+# Variance of predictions
+
+One last metric we used in the regularization model fitting notebook was the weighted
+variance of predicted values. The variance of predictions can be used
+as a measure of the amount of segmentation produced by a model. The greater the
+variance, the greater the amount of segmentation.
+
+The combination of Lorenz curves and distribution comparison curves is probably sufficient
+for model comparison and evaluation.
+
+One wants to have the maximum amount of directional segmentation as measured in a Lorenz curve
+as well as a distribution of predicted loss that is well-calibrated to the distribution
+of actual loss. Setting the optimization of those two criteria in place, the variance of
+predictions will be boxed in at whatever the model optimizing those two metrics produces.
+
+Thus for optimization, just considering the combination of Lorenz curve and distribution
+comparison curve probably suffices.
+
+However, it can still be useful or interesting to check the variance of predictions to get
+an idea of the amount of segmentation. If one is interested in assessing or
+quantifying the segmentation provided by a set of factors, the variance of predictions
+is a better way to quantify that than other metrics. See the document on 
+[interpreting factor relativities](interpreting_factors.html),
+which has a discussion on metrics for quantifying segmentation.
+
+# Analogy to decile lift charts
+
+There is a natural analogy between the distribution distance and prediction variance metrics 
+and some metrics calculated off of a decile lift chart. The distribution distance
+and prediction variance can be seen as continuous version analogues of their decile
+lift chart analogues.
+
+The following expandable chunk has code for creating lift charts, plotting lift charts,
+and computing metrics on lift charts.
+
+```{r, class.source = "fold-hide"}
+label_n_tile <- function(n_tiles) {
+  dplyr::recode(
+    as.character(n_tiles),
+    "3" = "tertile",
+    "4" = "quartile",
+    "5" = "quintile",
+    "6" = "sextile",
+    "7" = "septile",
+    "8" = "octile",
+    "10" = "decile",
+    "12" = "duodecile",
+    "16" = "hexadecile",
+    "20" = "ventile",
+    "100" = "percentile",
+    .default = paste0(n_tiles, "-quantile")
+  )
+}
+
+create_lift_chart <- function(data,
+                              pred_col,
+                              tgt_col,
+                              wgt_col,
+                              n_tiles = 10) {
+  wgt_col <- sym(wgt_col)
+  tgt_col <- sym(tgt_col)
+  pred_col <- sym(pred_col)
+  data_agg <- data %>%
+    dtplyr::lazy_dt() %>%
+    arrange(!!pred_col) %>%
+    mutate(.cum_pct_wgt = cumsum(!!wgt_col) / sum(!!wgt_col)) %>%
+    group_by(.n_tile = ceiling(n_tiles * .cum_pct_wgt)) %>%
+    summarise(
+      Predicted = sum(!!pred_col * !!wgt_col),
+      Actual = sum(!!tgt_col * !!wgt_col)
+    ) %>%
+    as_tibble()
+  data_agg %>%
+    tidyr::pivot_longer(c(Predicted, Actual), names_to = "type") %>%
+    mutate(type = factor(type, levels = c("Predicted", "Actual"))) %>%
+    rename(n_tile = .n_tile)
+}
+
+calc_lift_stats <- function(lift_chart) {
+  lift_chart %>%
+    tidyr::pivot_wider(names_from = type, values_from = value) %>%
+    arrange(n_tile) %>%
+    summarise(
+      n_tile_mape = yardstick::mape_vec(Predicted, Actual),
+      n_tile_ratio = dplyr::last(Actual) / dplyr::first(Actual)
+    )
+}
+
+plot_lift_chart <- function(lift_data,
+                            title_label,
+                            tgt_label,
+                            wgt_label) {
+  n_tile_label <- label_n_tile(max(lift_data[["n_tile"]]))
+  ggplot(data = lift_data) +
+    theme_minimal() +
+    geom_bar(
+      aes(x = n_tile, y = value, fill = type),
+      stat = "identity",
+      position = "dodge"
+    ) +
+    scale_x_continuous(stringr::str_to_title(n_tile_label), breaks = 1:10) +
+    scale_y_continuous(tgt_label, labels = scales::comma) +
+    theme(legend.title = element_blank()) +
+    ggtitle(
+      glue::glue("Actual vs predicted by {n_tile_label} - {title_label}"),
+      subtitle = glue::glue("Equal {wgt_label} in each {n_tile_label}")
+    )
+}
+```
+
+Let's create a lift chart for the first simulated example.
+
+```{r, class.source = "fold-s"}
+sim_decile_lift <- create_lift_chart(
+  data_sim_pred_1, 
+  "predict",
+  "loss", 
+  "weight"
+)
+```
+
+The `plot_lift_chart` function can be used to plot lift charts.
+
+```{r}
+plot_lift_chart(
+  sim_decile_lift, 
+  "Simulated model lift chart",
+  "Loss", 
+  "Exposure"
+)
+```
+
+The `calc_lift_stats` function will calculate two metrics from the
+lift chart: the MAPE across the deciles and the ratio between the high and low deciles.
+
+```{r}
+calc_lift_stats(sim_decile_lift)
+```
+
+The MAPE of bins in a lift chart can be seen as being like the distribution distance metric.
+
+We are getting a quantiative measure of the fit of the predicted values to the 
+actual distribution, in terms of how closely the 
+predicted loss dollars match the actual loss dollars in a decile.
+
+Like the distribution distance metric, decile lift chart MAPE suffers from the same pitfall
+when it comes to random predictions.
+
+Let's plot decile lift charts for the four sets of predicted values on the first simulated example.
+
+```{r}
+decile_lift_1 <- create_lift_chart(
+  data_sim_pred_random, 
+  "predict_1", 
+  "loss", 
+  "weight"
+)
+
+decile_lift_2 <- create_lift_chart(
+  data_sim_pred_random, 
+  "predict_2", 
+  "loss", 
+  "weight"
+)
+
+decile_lift_3 <- create_lift_chart(
+  data_sim_pred_random, 
+  "predict_3", 
+  "loss", 
+  "weight"
+)
+
+decile_lift_4 <- create_lift_chart(
+  data_sim_pred_random, 
+  "predict_random", 
+  "loss", 
+  "weight"
+)
+
+plot_lift_chart(
+  decile_lift_1, 
+  "best fit",
+  "Loss", 
+  "Exposure"
+)
+
+plot_lift_chart(
+  decile_lift_2, 
+  "too flat",
+  "Loss", 
+  "Exposure"
+)
+
+plot_lift_chart(
+  decile_lift_3, 
+  "too steep",
+  "Loss", 
+  "Exposure"
+)
+
+plot_lift_chart(
+  decile_lift_4, 
+  "random predictions",
+  "Loss", 
+  "Exposure"
+)
+```
+
+Let's calculate the lift metrics for each of the four sets of predictions.
+
+```{r}
+calc_lift_stats(decile_lift_1)
+calc_lift_stats(decile_lift_2)
+calc_lift_stats(decile_lift_3)
+calc_lift_stats(decile_lift_4)
+```
+
+We see that the random predictions had very low MAPE, similar to that of the
+fitted model predictions. This is just like the low distribution distance of
+random predictions for the distribution distance curve.
+
+The high/low decile ratio can be seen as a decile lift chart analogue of
+the variance of predictions. A higher high/low decile ratio indicates a greater
+range of segmentation.
+
+The advantage of the distribution difference curve and variance of predictions
+as measures (along with the Lorenz curve) is that they operate on the full
+distribution without introducing some of the artificiality and loss of information
+that can result from discretization. Furthermore, these metrics can be
+interpreted as being like continuous versions of metrics computed off of
+decile lift charts, perhaps making it easier for someone familiar with decile
+lift charts to readily understand.
+
+
+
