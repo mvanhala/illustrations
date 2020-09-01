@@ -1,0 +1,541 @@
+---
+title: "Data manipulation and reshaping with dplyr, data.table, dtplyr, tidyr, and tidyfast"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: show
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# Introduction
+
+In this document, we illustrate basic data manipulation operations, comparing
+`dplyr` and `data.table`. We also compare basic reshaping operations 
+using `tidyr` and the `data.table`-based `tidyfast`.
+
+The data we use for illustration consists of twenty years of daily weather
+for a set of airport weather stations.
+
+# Data
+
+```{r}
+library(dplyr)
+library(dtplyr)
+library(data.table)
+library(tidyr)
+library(tidyfast)
+```
+
+```{r}
+weather_tbl <- readRDS("data/noaa/lcd/lcd_daily_selected.rds")
+weather_dt <- as.data.table(weather_tbl)
+```
+
+# Copying local data to remote source
+
+You can use the `copy_to` function in `dplyr` to copy a local data frame to a 
+remote data source. By default, it will be copied to a temporary table.
+
+For our example of working with a remote SQL source with `dplyr`, we will use 
+an in-memory SQLite database.
+
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+
+weather_sql <- weather_tbl %>%
+  mutate(across(date, as.character)) %>%
+  copy_to(con, .)
+```
+
+The object `weather_sql` is a pointer to the temporary SQLite table
+to which the data was copied.
+
+```{r}
+class(weather_sql)
+str(weather_sql)
+```
+
+```{r}
+dim(weather_tbl)
+dim(weather_dt)
+dim(weather_sql)
+```
+
+Calling `nrow` on a SQL table will not give you the number of rows, since calculating the 
+row count is an expensive operation. Instead `NA` is returned (as well as in the number
+of rows in a `dim` call). To get the number of rows, you need to call `count`.
+
+```{r}
+count(weather_sql)
+```
+
+# Comparing syntax for dplyr-type verbs
+
+## select
+
+Here we select a few columns from the weather table.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  select(station, city, date, temp_max)
+```
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  select(station, city, date, temp_max)
+```
+
+### data.table
+
+```{r}
+weather_dt[, .(station, city, date, temp_max)]
+```
+
+
+### dtplyr
+
+```{r}
+weather_dt %>%
+  lazy_dt() %>%
+  select(station, city, date, temp_max) %>%
+  as.data.table()
+```
+
+## Filter
+
+Let's filter to days where the high temperature was greater than or equal to 100 degrees.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  select(station, city, date, temp_max) %>%
+  filter(temp_max >= 100)
+```
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  select(station, city, date, temp_max) %>%
+  filter(temp_max >= 100)
+```
+
+### data.table
+
+```{r}
+weather_dt[temp_max >= 100, .(station, city, date, temp_max)]
+```
+
+### dtplyr
+
+```{r}
+weather_tbl %>%
+  lazy_dt() %>%
+  select(station, city, date, temp_max) %>%
+  filter(temp_max >= 100) %>%
+  as.data.table()
+```
+
+## Mutate
+
+Let's create a variable for the diurnal range, that is, the difference between the high and low temperature
+on a day.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  select(station, city, date, temp_max, temp_min) %>%
+  mutate(temp_range = temp_max - temp_min)
+```
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  select(station, city, date, temp_max, temp_min) %>%
+  mutate(temp_range = temp_max - temp_min)
+```
+
+### data.table
+
+```{r}
+weather_dt[, temp_range := temp_max - temp_min]
+weather_dt[, .(station, city, date, temp_max, temp_min, temp_range)]
+```
+
+### dtplyr
+
+```{r}
+weather_tbl %>%
+  lazy_dt() %>%
+  select(station, city, date, temp_max, temp_min) %>%
+  mutate(temp_range = temp_max - temp_min) %>%
+  as.data.table() %>%
+  print()
+```
+
+## Sorting
+
+Let's sort by descending amount of precipitation.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  select(station, city, date, precipitation) %>%
+  arrange(desc(precipitation))
+```
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  select(station, city, date, precipitation) %>%
+  arrange(desc(precipitation))
+```
+
+### data.table
+
+```{r}
+weather_dt[, .(station, city, date, precipitation)][order(-precipitation)]
+```
+
+### dtplyr
+
+```{r}
+weather_tbl %>%
+  lazy_dt() %>%
+  select(station, city, date, precipitation) %>%
+  arrange(desc(precipitation)) %>%
+  as.data.table()
+```
+
+
+## Summarizing (and grouping)
+
+Let's calculate the number of days with highs over 100 at each station over the entire
+20-year period.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  group_by(station, city) %>% 
+  summarise(days_over_100 = sum(temp_max > 100, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  arrange(desc(days_over_100))
+```
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  mutate(over_100 = if_else(temp_max > 100, 1, 0)) %>%
+  group_by(station, city) %>% 
+  summarise(days_over_100 = sum(over_100)) %>% 
+  ungroup() %>%
+  arrange(desc(days_over_100))
+```
+
+### data.table
+
+```{r}
+weather_dt[, .(days_over_100 = sum(temp_max > 100, na.rm = TRUE)), .(station, city)][order(-days_over_100)]
+```
+
+### dtplyr
+
+```{r}
+weather_tbl %>%
+  lazy_dt() %>%
+  group_by(station, city) %>% 
+  summarise(days_over_100 = sum(temp_max > 100, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  arrange(desc(days_over_100)) %>%
+  as.data.table()
+```
+
+## Example
+
+Let's compute the average high and low temperatures in Seattle each month in 2019.
+
+### dplyr (local)
+
+```{r}
+weather_tbl %>%
+  filter(city == "Seattle", lubridate::year(date) == 2019) %>%
+  group_by(month = lubridate::month(date)) %>%
+  summarise_at(vars(temp_max, temp_min), mean)
+```
+
+
+### dplyr (remote SQL source)
+
+```{r}
+weather_sql %>%
+  filter(city == "Seattle", strftime("%Y", date) == "2019") %>%
+  group_by(month = strftime("%m", date)) %>%
+  summarise_at(vars(temp_max, temp_min), mean)
+```
+
+### data.table
+
+```{r}
+weather_dt[city == "Seattle" & lubridate::year(date) == 2019,
+           .(temp_max = mean(temp_max), temp_min = mean(temp_min)),
+           .(month = lubridate::month(date))]
+```
+
+### dtplyr
+
+```{r}
+weather_tbl %>%
+  lazy_dt() %>%
+  filter(city == "Seattle", lubridate::year(date) == 2019) %>%
+  group_by(month = lubridate::month(date)) %>%
+  summarise_at(vars(temp_max, temp_min), mean) %>%
+  as.data.table()
+```
+
+
+# Lazy evaluation in dplyr SQL backends and dtplyr (data.table backend)
+
+Both the `dplyr` SQL backend and `dtplyr` use lazy evaluation. That is,
+computation is not executed until triggered by something.
+
+## dplyr with SQL sources
+
+Suppose, following our example above, we want to compute the average high and low 
+temperatures each month in 2019 in Seattle.
+
+We use the following routine `dplyr` statements.
+
+```{r}
+seattle_weather_2019 <- weather_sql %>%
+  filter(city == "Seattle", strftime("%Y", date) == "2019") %>%
+  group_by(month = strftime("%m", date)) %>%
+  summarise_at(vars(temp_max, temp_min), mean)
+```
+
+At this point, nothing has been executed against the SQL table.
+
+The `seattle_weather_2019` object just contains the data and instructions needed
+to construct the query to execute when it does get executed.
+
+```{r}
+class(seattle_weather_2019)
+str(seattle_weather_2019)
+```
+
+### Viewing SQL query
+
+You can see the query that will be executed by calling `show_query`.
+
+```{r}
+show_query(seattle_weather_2019)
+```
+
+### Executing SQL query
+
+This query gets executed when you print the object (in which case it will execute to 
+get the first 10 rows to print), or explicitly call `compute` or `collect`.
+
+The difference between `compute` and `collect` is a matter of where the result goes
+after execution.
+
+When you call `compute`, the query is executed and the result is put in a table
+(temporary table by default, but can be a permanent table).
+
+```{r}
+seattle_weather_2019_sql <- seattle_weather_2019 %>%
+  compute()
+
+seattle_weather_2019_sql
+class(seattle_weather_2019_sql)
+str(seattle_weather_2019_sql)
+```
+
+When you call `collect`, the result is pulled down into a local data frame in R.
+
+```{r}
+seattle_weather_2019_df <- seattle_weather_2019 %>%
+  collect()
+
+seattle_weather_2019_df
+class(seattle_weather_2019_df)
+str(seattle_weather_2019_df)
+```
+
+When working with tables, it can be useful to call `compute` every few steps. 
+As more steps are added to the `dplyr` statement, the query to be executed becomes
+more complex, which can make debugging trickier.
+
+## dtplyr with data.table sources
+
+Using `dtplyr` is similar to using `dplyr` with SQL data sources. We likewise have lazy evaluation,
+in which computation does not occur until forced.
+
+We call `lazy_dt` on a tibble/data.table to use `dtplyr`.
+
+```{r}
+seattle_weather_2019_dt <- weather_tbl %>%
+  lazy_dt() %>%
+  filter(city == "Seattle", year(date) == 2019) %>%
+  group_by(month = month(date)) %>%
+  summarise_at(vars(temp_max, temp_min), mean)
+```
+
+As with the SQL data source, nothing has been executed at this point. The object contains
+the structure and instructions needed to execute the data manipulation steps when execution
+is invoked.
+
+```{r}
+class(seattle_weather_2019_dt)
+str(seattle_weather_2019_dt)
+```
+
+Like with SQL data sources, you can call `show_query` on the object, to see the data.table
+command that will be executed.
+
+```{r}
+show_query(seattle_weather_2019_dt)
+```
+
+Execution occurs when you call `as_tibble` or `as.data.table`.
+
+```{r}
+as_tibble(seattle_weather_2019_dt)
+as.data.table(seattle_weather_2019_dt)
+```
+
+It will also execute to get the first few rows to print if you print the object.
+
+```{r}
+seattle_weather_2019_dt
+```
+
+
+# Syntax for tidyr-type reshaping
+
+```{r include = FALSE}
+weather_dt <- as.data.table(weather_tbl)
+```
+
+Analogy: `tidyfast` is to `tidyr` what `dtplyr` is to `dplyr`.
+
+`dtplyr` allows you to use the syntax of `dplyr` on a `data.table` backend.
+
+`tidyfast` allows you to use the syntax of `tidyr` on a `data.table` backend.
+
+We will show some of the basic, core functionality of `tidyr`, specifically nesting/unnesting and pivoting.
+
+There is more functionality in `tidyfast`, and there is more functionality in `tidyr` 
+than in `tidyfast`, but we will focus on these core reshaping capabilities here.
+
+## Nesting
+
+### dplyr/tidyr
+
+```{r}
+weather_nested_dplyr <- weather_tbl %>%
+  group_nest(station, city, state)
+```
+
+### tidyfast
+
+```{r}
+weather_nested_tidyfast <- weather_dt %>%
+  dt_nest(station, city, state)
+```
+
+## Unnesting
+
+### tidyr
+
+```{r}
+unnest(weather_nested_dplyr, data)
+```
+
+### tidyfast
+
+```{r}
+dt_unnest(weather_nested_tidyfast, data)
+```
+
+## Pivot wider
+
+Let's get a data set where there is a column for each city, containing the high temperature on each date.
+
+### tidyr
+
+```{r}
+temp_wide_tbl <- weather_tbl %>%
+  select(date, city, temp_max) %>%
+  pivot_wider(names_from = city, values_from = temp_max)
+
+temp_wide_tbl
+```
+
+### tidyfast
+
+```{r}
+temp_wide_dt <- weather_dt %>%
+  lazy_dt() %>%
+  select(date, city, temp_max) %>%
+  as.data.table() %>%
+  dt_pivot_wider(names_from = city, values_from = temp_max)
+
+temp_wide_dt
+```
+
+## Pivot longer
+
+### tidyr
+
+```{r}
+temp_wide_tbl %>%
+  pivot_longer(c(-date), names_to = "city", values_to = "temp_max")
+```
+
+### tidyfast
+
+```{r}
+temp_wide_dt %>%
+  dt_pivot_longer(c(-date), names_to = "city", values_to = "temp_max")
+```
+
+## Reshaping on SQL sources
+
+There is no built-in SQL translation of reshaping operations in `dplyr`, `dbplyr`, or
+`tidyr`. To get such functionality you need to write the SQL translation in your own
+functions.
+
+As an example, I wrote functions for `gather` and `spread` 
+[transformations in Hive](https://github.com/ZurichPA/honeycomb/blob/master/R/reshaping.R) 
+(`gather`/`spread` are now superseded by the `pivot_longer`/`pivot_wider` functions).
+
+# Cleanup
+
+```{r}
+DBI::dbDisconnect(con)
+```
+
