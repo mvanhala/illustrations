@@ -1,0 +1,566 @@
+---
+title: "A method for semiparametric estimation of increased limit factors"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+library(actuar)
+library(data.table)
+library(fitdistrplus)
+library(ggalt)
+library(ggplot2)
+library(survival)
+library(dplyr)
+
+set.seed(128)
+```
+
+# Introduction
+
+Our goal in this analysis is to compute increased limit factors. To do so we need to estimate the claim-level loss distribution. 
+
+We will use a semiparametric approach for estimating the loss distribution, where low-dollar claims will be estimated with a
+nonparametric Kaplan-Meier estimator, and high-dollar claims will be estimated by fitting a parametric distribution.
+
+# Kaplan-Meier estimator
+
+The Kaplan-Meier or product-limit estimator is a popular nonparametric estimator of the survival function in the presence of censored data.
+
+For a random variable $X$, the survival function at time $t$ is the probability of surviving beyond time $t$, or $P(X > t)$. The survival function is denoted $S(t)$. Note that $S(t) = 1 - F(t)$, where $F(t) = P(X \leq t)$, the cumulative distribution function of $X$.
+
+The Kaplan-Meier estimator of the survival function is
+
+$$
+\widehat{S}(t) = \prod_{t_i \leq t} \left( 1 - \dfrac{d_i}{n_i} \right),
+$$
+
+where $t_i$ is a time at which a failure occurred, $d_i$ is the number of failures that occurred at time $t_i$, and $n_i$ is the number of units at risk immediately preceding $t_i$.
+
+In the case where there is no censoring, the Kaplan-Meier estimator reduces to the empirical CDF.
+
+## Application to insurance losses
+
+The Kaplan-Meier estimator can be applied in estimating the severity distribution. In this case, the distribution of the random variable $X$ is the severity distribution, and the time $t$ represents the size of loss.
+
+## Example
+
+Suppose we have the following losses. If a loss is a policy limit loss, it is denoted by $L+$. If a loss is for less than the policy limit, it is denoted by $L$, without any $+$.
+
+1000
+12000
+25000+
+25000+
+48000
+48000
+50000+
+63000
+87000
+100000+
+
+At 1000, we have ten losses "at risk" and one loss, so
+
+$$
+\widehat{S}(1000) = 1 - \dfrac{1}{10} = 0.9.
+$$
+
+At 12000, we have nine losses "at risk", so
+
+$$
+\widehat{S}(12000) = \left(1 - \dfrac{1}{10}\right)\left( 1 - \dfrac{1}{9} \right) = 0.8
+$$
+
+At 48000, we have six losses "at risk" and two losses, so
+
+$$
+\widehat{S}(48000) = \left(1 - \dfrac{1}{10}\right)\left( 1 - \dfrac{1}{9} \right)\left( 1 - \dfrac{2}{6} \right) \approx 0.533
+$$
+
+At 63000, we have three losses "at risk", so
+
+$$
+\widehat{S}(63000) = \left(1 - \dfrac{1}{10}\right)\left( 1 - \dfrac{1}{9} \right)\left( 1 - \dfrac{2}{6} \right)\left(1 - \dfrac{1}{3} \right) \approx 0.356
+$$
+
+At 87000, we have two losses "at risk", so
+
+$$
+\widehat{S}(87000) = \left(1 - \dfrac{1}{10}\right)\left( 1 - \dfrac{1}{9} \right)\left( 1 - \dfrac{2}{6} \right)\left(1 - \dfrac{1}{3} \right)\left(1 - \dfrac{1}{2} \right) \approx 0.178
+$$
+
+The following is a plot of the survival function.
+
+```{r}
+loss_survival_direct <- tribble(
+  ~loss, ~survfun,
+  0, 1,
+  1000, 0.9,
+  12000, 0.8,
+  48000, 0.533,
+  63000, 0.356,
+  87000, 0.178,
+  100000, 0.178
+) %>%
+  mutate(distfun = 1 - survfun)
+
+ggplot(data = loss_survival_direct) + 
+  theme_minimal() + 
+  geom_step(aes(x = loss, y = survfun)) +
+  ggtitle("Nonparametric estimate of severity survival function") +
+  theme(axis.title = element_blank())
+
+ggplot(data = loss_survival_direct) + 
+  theme_minimal() + 
+  geom_step(aes(x = loss, y = distfun)) +
+  ggtitle("Nonparametric estimate of severity distribution function") +
+  theme(axis.title = element_blank())
+```
+
+The `survfit` function in the `survival` to fit a survival model, including a Kaplan-Meier estimator.
+
+```{r}
+loss_data <- tribble(
+  ~loss, ~actual,
+  1000, 1,
+  12000, 1,
+  25000, 0,
+  25000, 0,
+  48000, 1,
+  48000, 1,
+  50000, 0,
+  63000, 1,
+  87000, 1,
+  100000, 0
+)
+
+loss_data_km <- survfit(Surv(loss, actual) ~ 1, data = loss_data)
+
+loss_data_km_df <- tibble(
+  loss = c(0, loss_data_km$time),
+  survfun = c(1, loss_data_km$surv)
+)
+
+ggplot(data = loss_data_km_df) + 
+  theme_minimal() + 
+  geom_step(aes(x = loss, y = survfun)) +
+  ggtitle("Nonparametric estimate of severity survival function") +
+  theme(axis.title = element_blank())
+```
+
+It should be clear that the Kaplan-Meier estimate reduces to the empirical CDF if there is no censoring. Suppose the total total sample size is $n$ and up to time $t$ there are $d_1$ failures at time $t_1$, $d_2$ failures at time $t_2$, and so on, up to $d_k$ failures at time $t_k$. The Kaplan-Meier estimate of the survival function is then
+
+$$
+\begin{align}
+\widehat{S}(t) &= \left(1 - \dfrac{d_1}{n}\right) \left( 1 - \dfrac{d_2}{n - d_1} \right)\cdots \left( 1 - \dfrac{d_k}{n - d_1 - d_2 - \cdots - d_{k-1}} \right) \\
+&= \left( \dfrac{n - d_1}{n}\right) \left( \dfrac{n - d_1 - d_2}{n - d_1}\right) \cdots \left( \dfrac{n - d_1 - d_2 - \cdots -d_k}{n - d_1 - d_2 - \cdots - d_{k-1}}\right) \\
+&= \dfrac{n - d_1 - d_2 - \cdots - d_{k}}{n}.
+\end{align}
+$$
+
+# Censoring in personal auto liability claim data
+
+There are two levels at which censoring may occur in auto liability loss data. Auto policy limits are either split limits or combined single limit. A split limit is of the form $L_1/L_2$, where $L_2$ is the limit for a single claim, while $L_1$ is the limit for a single claimant on a claim. Examples of split limits include \$50,000/\$100,000 and \$100,000/\$300,000. A combined single limit is a limit such that the claimant limit is equal to the claim limit. It can be put in the form $L_1/L_2$, where $L_1 = L_2$. Therefore, on a claim, there are two points at which a limit may be hit. One is the claimant limit, and the other is the claim limit.
+
+# Simulated data
+
+We will simulate data for 50,000 claims.
+
+We will use seven different limits: 25,000/50,000; 50,000/100,000; 100,000/300,000; 300,000/500,000; 300,000 CSL; 500,000 CSL; and 1,000,000 CSL.
+In our simulation, the lower limits will be more common.
+
+```{r}
+limits <- tribble(
+  ~desc, ~limit_1, ~limit_2, ~prob,
+  "25/50", 25000, 50000, 0.3,
+  "50/100", 50000, 100000, 0.15,
+  "100/300", 100000, 300000, 0.15,
+  "300/500", 300000, 500000, 0.15,
+  "300K CSL", 300000, 300000, 0.15,
+  "500K CSL", 500000, 500000, 0.08,
+  "1M CSL", 1000000, 1000000, 0.02
+)
+```
+
+For each claim will simulate a random number of claimants. The numbers of claimants for claim $i$ will
+be $1 + X_i$, where $X_i$ are independent and identically distributed draws from a Poisson distribution
+with parameter $\lambda = 1$.
+
+```{r}
+n_claims <- 50000
+
+claim_base <- tibble(
+  claim_id = 1:n_claims,
+  n_claimant = 1 + rpois(n_claims, lambda = 1),
+  limit = sample(limits$desc, size = n_claims, replace = TRUE, prob = limits$prob)
+) %>%
+  mutate(claimant_id = purrr::map(n_claimant, ~1:.)) %>%
+  tidyr::unnest(claimant_id) 
+```
+
+The unlimited loss amount for each claimant will be simulated from a mixture distribution,
+where the mixture has a weight of 0.95 on a gamma distribution with shape parameter $\alpha = 2$ 
+and scale parameter $\beta = 10,000$; and a weight of 0.05 on a 1-parameter 
+Pareto distribution with shape parameter $\alpha = 1.5$ and minimum parameter $m = 100,000$.
+
+```{r}
+claim_unlimited <- claim_base %>%
+  mutate(
+    part_1 = rgamma(nrow(.),shape = 2, scale = 5000),
+    part_2 = actuar::rpareto1(nrow(.), shape = 2.5, min = 100000),
+    loss_unlimited = if_else(runif(nrow(.)) <= 0.95, part_1, part_2)
+  )
+```
+
+We will then limit the claimant-level loss to the claimant limit.
+
+```{r}
+claim_limit_1 <- claim_unlimited %>%
+  left_join(limits, by = c("limit" = "desc")) %>%
+  mutate(loss_limit_1 = round(pmin(loss_unlimited, limit_1)))
+```
+
+Next we will apply the aggregate claim-level limit. If the aggregate limit is exceeded
+we will decrease each claimant loss pro rata in proportion to their claimant-limited loss.
+
+```{r}
+claim_limit_2 <- claim_limit_1 %>%
+  group_by(claim_id) %>%
+  mutate(loss_limit_1_total = sum(loss_limit_1)) %>%
+  ungroup() %>%
+  mutate(loss_limit_2 = loss_limit_1 * pmin(limit_2, loss_limit_1_total) / loss_limit_1_total)
+```
+
+We'll tweak for rounding.
+
+
+```{r}
+claim_limit_round <- claim_limit_2 %>%
+  mutate(across(c(loss_limit_1, loss_limit_2), round)) %>%
+  group_by(claim_id) %>%
+  mutate(loss_limit_2_total = sum(loss_limit_2)) %>%
+  ungroup() %>%
+  mutate(
+    loss_limit_2 = if_else(
+      n_claimant == claimant_id & loss_limit_1 != loss_limit_2, 
+      loss_limit_2 + (limit_2 - loss_limit_2_total), 
+      loss_limit_2
+    )
+  )
+```
+
+Now we'll select the columns to be in the form that might exist in a claims system,
+where we just have the claim and claimant ids, the limits, and the limited loss amount
+for the claimant.
+
+```{r}
+claim_data <- claim_limit_round %>%
+  select(claim_id, claimant_id, limit_desc = limit, limit_1, limit_2, loss = loss_limit_2)
+```
+
+Let's look at a few rows of the data.
+
+```{r}
+claim_data
+```
+
+# Kaplan-Meier estimator of claimant loss distribution
+
+Let's construct the Kaplan-Meier estimator of the claimant loss distribution.
+
+Let's construct an indicator for whether the claimant loss observation is right-censored: if the paid amount exceeds the claimant limit or if the claim aggregate limit was reached.
+
+```{r}
+claimant_loss_cens <- claim_data %>%
+  group_by(claim_id) %>%
+  mutate(loss_claim = sum(loss)) %>%
+  ungroup() %>%
+  mutate(
+    censored = case_when(
+      loss >= limit_1 ~ 1,
+      loss_claim >= limit_2 ~ 1,
+      TRUE ~ 0
+    ),
+    uncensored = 1 - censored
+  )
+```
+
+Now we fit the Kaplan-Meier estimate using `survfit` in the `survival` package, then extract the data for plotting.
+
+```{r}
+claimant_loss_km <- survfit(
+  Surv(loss, uncensored) ~ 1, 
+  data = claimant_loss_cens
+)
+
+claimant_loss_km_df <- unclass(claimant_loss_km)[c("time", "surv", "lower", "upper")] %>% 
+  as_tibble() %>% 
+  add_row(time = 0, surv = 1, lower = 1, upper = 1, .before = 1) %>%
+  mutate(incremental_prob = lag(surv, default = 1) - surv)
+```
+
+## Plots
+
+```{r}
+ggplot(data = claimant_loss_km_df, aes(x = time)) + 
+  theme_minimal() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), stat = "stepribbon", fill = "grey70") +
+  geom_step(aes(y = surv)) + 
+  theme(axis.title = element_blank()) + 
+  ggtitle("Kaplan-Meier estimator of claimant loss distribution") +
+  scale_x_continuous(label = scales::comma)
+```
+
+```{r}
+ggplot(data = claimant_loss_km_df, aes(x = time)) + 
+  theme_minimal() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), stat = "stepribbon", fill = "grey70") +
+  geom_step(aes(y = surv)) + 
+  theme(axis.title = element_blank()) + 
+  ggtitle("Kaplan-Meier estimator of claimant loss distribution") +
+  scale_x_log10(label = scales::comma)
+```
+
+```{r}
+ggplot(data = claimant_loss_km_df, aes(x = time)) + 
+  theme_minimal() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), stat = "stepribbon", fill = "grey70") +
+  geom_step(aes(y = surv)) + 
+  theme(axis.title = element_blank()) + 
+  ggtitle("Kaplan-Meier estimator of claimant loss distribution") +
+  coord_cartesian(ylim = c(0, 0.1)) +
+  scale_x_continuous(label = scales::comma)
+```
+
+```{r}
+ggplot(data = claimant_loss_km_df, aes(x = time)) + 
+  theme_minimal() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), stat = "stepribbon", fill = "grey70") +
+  geom_step(aes(y = surv)) + 
+  theme(axis.title = element_blank()) + 
+  ggtitle("Kaplan-Meier estimator of claimant loss distribution") +
+  coord_cartesian(ylim = c(0, 0.05)) +
+  scale_x_continuous(label = scales::comma)
+```
+
+# Calculating ILFs
+
+## Methodology
+
+Our goal in this analysis is to compute increased limit factors. To do so we need to estimate the claim-level loss distribution. Thus far we have seen how to construct a nonparametric estimate fo the claimant-level loss distribution.
+
+### Simulating claims
+
+To estimate the claim-level loss distribution, we shall use simulation. One key assumption we will make is that the number of claimants on a claim and the loss amount of a claimant are independent. This assumption deserves further investigation. It may well not bear out, in which case the use of copulas would probably be helpful. However, for now we will make this independence assumption.
+
+Then to simulate the claim-level loss distribution, we apply the following method.
+
+* Select a number of claims $n$ to simulate.
+
+* For each claim, simulate the number of claimants on the claim by a draw from the empirical distribution of the number of claimants
+
+* For each claimant, simulate the loss by a draw from the loss distribution estimated by the Kaplan-Meier estimator
+
+### Limited data at high values
+
+```{r}
+max_loss_actual <- claimant_loss_cens %>% 
+  filter(uncensored == 1) %>% 
+  pull(loss) %>%
+  max()
+
+max_loss_any <- max(claimant_loss_cens$loss)
+
+loss_1m_pct <- claimant_loss_cens %>%
+  summarise(million_pct = sum(limit_1 == 1000000) / n())
+```
+
+Note that data is thin at high loss amounts. The largest non-censored claimant loss is \$`r formatC(max_loss_actual, format = "f", digits = 0, big.mark = ",")`. Only a small percentage of losses (`r formatC(100 * loss_1m_pct$million_pct, digits = 1, format = "f")`%) are on $1,000,000 CSL policies. Thus we run into trouble when trying to simulate at the tail of the distribution. One possibility would be set loss in the tail of the distribution (where the random uniform variate is less than the minimum of the estimated Kaplan-Meier survival function) to the maximum observed claimant loss value, regardless of censoring (\$`r formatC(max_loss_any, format = "f", digits = 0, big.mark = ",")`). However, this is unsatisfactory, as we are just cutting off the right tail of the distribution, ultimately underestimating the expected loss for million dollar limit policies and thus underestimating the \$1 million CSL ILF. The only case in which the layer from \$500,000 to \$1,000,000 would get pierced in the simulation is with multiple claimants each having high losses. The simulation would not pick up single claimants with high losses, which may be rare (as this data clearly indicates), but is certainly possible.
+
+## Parametric estimation of high-value losses
+
+Ultimately, with effectively no data on losses exceeding $500,000, we are unable to nonparametrically estimate the claimant loss distribution in this region.
+
+Instead, we will parametrically estimate the claimant severity distribution for large losses. We will fit a [Pareto distribution](https://en.wikipedia.org/wiki/Pareto_distribution) to losses. Specifically, we will fit a Pareto distribution to losses exceeding \$100,000, so the minimum parameter $m$ is \$100,000. Using the `fitdistcens` function in the `fitdistrplus` package, we can fit a one-parameter Pareto distribution on censored losses exceeding \$100,000 to estimate the shape parameter.
+
+### Calculating limited expected values
+
+After gettting a set of simulated claims, for the basic limit $\textrm{BL}_1/\textrm{BL}_2$ we apply the claimant limit $\textrm{BL}_1$ at the claimant level, then aggregate to the claim level and apply the claim limit $\textrm{BL}_2$, so for each simulated claim, we have the loss after applying the basic limit. For each increased limit combination $\textrm{IL}_1/\textrm{IL}_2$, we do the same, applying the limits and computing the loss for each simulated claim. We then compute the mean loss with limits $\textrm{BL}_1/\textrm{BL}_2$ and the mean loss with limits $\textrm{IL}_1/\textrm{IL}_2$. The increased limit factor for $\textrm{IL}_1/\textrm{IL}_2$ is then the ratio of the mean loss of the simulated claims at increased limits to the mean loss of the simulated claims at basic limits.
+
+
+## Functions
+
+The following functions implement the methodology described in the preceding section, for simulating a set of claims and computing limited expected values. As described, the simulated is based on simulating the number of claimants by a draw from the empirical distribution of the number of claimants, then simulating the loss for each claimant as a draw from the Kaplan-Meier estimated distribution, with a draw from a Pareto distribution in the right tail beyond the extreme of the Kaplan-Meier estimate.
+
+```{r}
+sim_data <- function(data, n, idcol) {
+  idcol <- sym(idcol)
+  km_fit <- survfit(Surv(loss, uncensored) ~ 1, data = data)
+  n_clmnt <- count(data, !!idcol)[["n"]]
+  
+  losses <- tibble(claim_id = 1:n) %>%
+    mutate(n_claim = sample(n_clmnt, n, replace = TRUE)) %>%
+    slice(rep(1:n, times = n_claim)) %>%
+    mutate(unif_loss = runif(nrow(.))) %>%
+    mutate(loss = unname(quantile(km_fit, unif_loss)$quantile))
+  
+  large_loss_cens <- data %>%
+    filter(loss >= 100000) %>% 
+    transmute(
+      left = loss,
+      right = if_else(uncensored == 1, loss, NA_real_)
+    )
+  
+  max_loss <- data %>%
+    filter(uncensored == 1) %>%
+    pull(loss) %>%
+    max()
+  
+  fit_pareto <- fitdistcens(
+    as.data.frame(large_loss_cens),
+    "pareto1", 
+    fix.arg = list(min = 100000)
+  )
+  
+  min_surv <- km_fit$surv[length(km_fit$surv) - 1]
+  
+  losses %>%
+    mutate(
+      loss = case_when(
+        is.na(loss) & unif_loss < 0.01 ~ min(km_fit$time),
+        is.na(loss) | loss >= 100000 ~ rpareto1(nrow(.), shape = fit_pareto[["estimate"]][["shape"]], min = 100000),
+        TRUE ~ loss
+      )
+    )
+}
+
+calc_lev <- function(data, limit_1, limit_2) {
+  data_limited <- data %>%
+    mutate(loss_limited = pmin(limit_1, loss)) %>%
+    as.data.table()
+  
+  claim_data <- data_limited[, .(loss_limited = sum(loss_limited)), .(claim_id)]
+  claim_data[, loss_limited := pmin(limit_2, loss_limited)]
+  mean(claim_data$loss_limited)
+}
+
+calc_ilfs <- function(data, n_sim_claim, idcol, limit_combos) {
+  data <- sim_data(data, n_sim_claim, idcol)
+  limit_combos %>%
+    mutate(lev = purrr::pmap_dbl(list(limit_1, limit_2), calc_lev, data = data))
+}
+```
+
+## Parameters
+
+We will simulate 1,000,000 claims to estimate the claim loss distribution.
+
+```{r}
+n_boot <- 100
+n_sim_claim <- 1000000
+
+limit_combos <- limits %>%
+  select(limit_1, limit_2)
+```
+
+## Estimate ILFs
+
+```{r}
+full_ilf <- claimant_loss_cens %>%
+  calc_ilfs(n_sim_claim, "claim_id", limit_combos) %>%
+  mutate(ilf = lev / first(lev))
+```
+
+## Bootstrapping
+
+To perform bootstrapping to get an estimate of the uncertainty in our estimates of the ILFs, we will resample the original loss data by resampling *claims* with replacement, then apply the method described above on the bootstrap data set to produce ILFs.
+
+```{r}
+claimant_loss_nest <- claimant_loss_cens %>%
+  group_by(claim_id) %>% 
+  tidyr::nest() %>%
+  ungroup()
+
+idx_list <- purrr::rerun(
+  n_boot,
+  sample.int(nrow(claimant_loss_nest), replace = TRUE)
+) 
+
+r_proc <- purrr::map(
+  split(idx_list, seq_along(idx_list) %% 4),
+  ~callr::r_bg(
+    function(idx, data, n_sim_claim, limit_combos) {
+      library(actuar)
+      library(data.table)
+      library(fitdistrplus)
+      library(survival)
+      library(dplyr)
+      
+      source("code/ilf/calc_ilf_fn.R")
+      
+      purrr::map(
+        idx,
+        function(idx) {
+          data %>%
+            slice(idx) %>%
+            mutate(claim_id = 1:n()) %>%
+            tidyr::unnest(c(data)) %>%
+            calc_ilfs(n_sim_claim, "claim_id", limit_combos) %>%
+            mutate(ilf = lev / first(lev))
+        }
+      )
+    },
+    args = list(
+      idx = .,
+      data = claimant_loss_nest, 
+      n_sim_claim = n_sim_claim, 
+      limit_combos = limit_combos
+    )
+  )
+)
+
+purrr::walk(r_proc, ~.$wait())
+```
+
+## Results
+
+The following table display the resulting calculated ILFs.
+
+```{r}
+boot_ilfs <- bind_rows(purrr::map_dfr(r_proc, ~.$get_result())) %>%
+  group_by(limit_1, limit_2) %>%
+  summarise(
+    boot_ilf_q05 = quantile(ilf, 0.05, names = FALSE, type = 8),
+    boot_ilf_q95 = quantile(ilf, 0.95, names = FALSE, type = 8)
+  ) %>%
+  ungroup()
+
+full_ilf %>%
+  left_join(boot_ilfs, by = c("limit_1", "limit_2")) %>%
+  select(
+    `Claimant limit` = limit_1,
+    `Claim limit` = limit_2,
+    ILF = ilf,
+    `Bootstrap (5% limit)` = boot_ilf_q05,
+    `Bootstrap (95% limit)` = boot_ilf_q95
+  ) %>%
+  gt::gt() %>%
+  gt::fmt_number(columns = 1:2, decimals = 0) %>%
+  gt::fmt_number(columns = 3:5, decimals = 3)
+```
+
