@@ -1,0 +1,677 @@
+---
+title: "Fitting elastic net models with a grid search"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: show
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# Introduction
+
+In this notebook we look at fitting generalized linear models with elastic net regularization.
+Elastic net models are a form of penalized regression. The elastic net penalty is a linear
+combination of the $L_1$ (lasso) and $L_2$ (ridge regression) penalties.
+
+The elastic net penalty is of the form
+
+$$
+\alpha \ell_1 + (1 - \alpha) \ell_1
+$$
+where $\ell_1$ is the $L_1$ penalty and $\ell_2$ is the $L_2$ penalty. Hence the lasso and ridge
+regression are special cases of the elastic net penalty. In particular, $\alpha = 1$ corresponds
+to lasso, and $\alpha = 0$ corresponds to ridge regression.
+
+Elastic net regularization offers advantages over the standard generalized linear modeling.
+Estimates from optimal elastic net models will often be more stable than those from an 
+ordinary generalized linear model, with lower overall error. In the bias-variance tradeoff,
+the benefit of reduced variance can outweigh the introduction of bias into estimates.
+
+Elastic net models can also more easily handle correlated predictors and categorical predictors
+with larger numbers of levels than an ordinary generalized linear model, which may require more
+manual touching and review in such cases.
+
+At the same time, elastic net models offset the exact same advantages with respect to interpretability
+and ease of implementation as the ordinary GLM. Elastic net models may thus provide
+a valuable tool for the insurance modeler.
+
+# Setup
+
+In this document, we will use a sample data of French personal auto policies from an 
+unknown insurer in the data set `freMPL1` in the `CASdatasets` package.
+
+```{r packages}
+library(CASdatasets)
+library(dplyr)
+library(ggplot2)
+library(h2o)
+
+set.seed(256)
+
+source("code/elastic_net_models/model_functions.R")
+
+data(freMPL1)
+```
+
+Here is a look at a few rows of the data.
+
+```{r}
+as_tibble(freMPL1)
+```
+
+There are `r formatC(nrow(freMPL1), format = 'f', big.mark = ',', digits = 0)` observations 
+in the data.
+
+We will use the majority of variables as predictors. Our target variable will be pure premium,
+taken as the ratio of loss to exposure.
+
+We will fit pure premium models as elastic net GLMs with a Tweedie distribution and log link function.
+We will use H2O to fit models. H2O is a great tool for fitting models, with a very efficient 
+algorithm for fitting regularized GLMs that also supports using a Tweedie distribution 
+in fitting regularized GLMs.
+
+We will perform a grid search in fitting the models. The grid will be over the $\alpha$ and $\lambda$
+values. Recall $\alpha$ controls the amount of $L_1$ vs. $L_2$ penalty, while $\lambda$ controls
+the overall amount of regularization. Higher values of $\lambda$ mean more regularization.
+
+At each combination of alpha/lambda on our grid, we will fit an elastic net GLM with 10-fold
+cross-validation. We will compute a few metrics using the cross-validated predictions (area under
+a Lorenz curve, Cramer-von Mises distance between the distributions of actual and predicted loss,
+and the weighted variance of predicted values).
+
+```{r data_modeling}
+.params <- list(
+  predictors = c(
+    "VehAge", "VehAge_log", "Gender", 
+    "MariStat", "SocioCateg", "VehUsage", "DrivAge", "DrivAge_log", 
+    "DrivAge_sqrt", "DrivAge_cubert", "HasKmLimit", "BonusMalus", 
+    "BonusMalus_log", "BonusMalus_sqrt", "VehBody", "VehEngine", 
+    "VehEnergy", "VehMaxSpeed", "VehMaxSpeed_log", "VehClass", "RiskVar", 
+    "RiskVar_log", "Garage"
+  ),
+  tgt_var = "target",
+  wgt_var = "Exposure",
+  n_folds = 10,
+  lambda_min_ratio = 0.00001,
+  nlambda = 100,
+  alpha_seq = seq(0, 1, by = 0.1),
+  fit_pars = list(
+    family = "tweedie", 
+    tweedie_variance_power = 1.5,
+    tweedie_link_power = 0
+  ),
+  h2o_mem = "32G",
+  h2o_cores = parallel::detectCores()
+)
+
+data <- freMPL1 %>%
+  as_tibble() %>% 
+  transmute(
+    PolNumber = 1:n(),
+    Exposure, 
+    VehAge = readr::parse_number(as.character(VehAge)),
+    VehAge_log = log(1 + VehAge),
+    Gender,
+    MariStat,
+    SocioCateg = forcats::fct_lump_prop(SocioCateg, 0.01, w = Exposure),
+    VehUsage,
+    DrivAge,
+    DrivAge_log = log(DrivAge),
+    DrivAge_sqrt = sqrt(DrivAge),
+    DrivAge_cubert = DrivAge ^ (1 / 3),
+    HasKmLimit = factor(HasKmLimit, levels = c(0, 1), labels = c("No", "Yes")),
+    BonusMalus,
+    BonusMalus_log = log(BonusMalus),
+    BonusMalus_sqrt = sqrt(BonusMalus),
+    VehBody,
+    VehEngine,
+    VehEnergy,
+    VehMaxSpeed = pmax(100, readr::parse_number(as.character(VehMaxSpeed))),
+    VehMaxSpeed_log = log(VehMaxSpeed),
+    VehClass, 
+    RiskVar,
+    RiskVar_log = log(RiskVar),
+    Garage, 
+    ClaimAmount,
+    target = ClaimAmount / Exposure
+  )
+
+checkmate::assert_subset(
+  .params$predictors,
+  colnames(data)
+)
+
+data_model <- data %>%
+  select(c(.params$predictors, .params$tgt_var, .params$wgt_var)) %>%
+  mutate_if(is.character, factor) %>%
+  mutate_at(.params$tgt_var, ~pmax(0, .)) %>%
+  mutate(
+    .fold = sample.int(.params$n_folds, nrow(.), replace = TRUE),
+    .loss = !!sym(.params$tgt_var) * !!sym(.params$wgt_var)
+  )
+```
+
+```{r start_h2o, results = "hide"}
+h2o.init(max_mem_size = .params$h2o_mem, nthreads = .params$h2o_cores)
+data_model_h2o <- h2o_import_fast(data_model)
+```
+
+# Find lambda.max
+
+Our first step in constructing a grid of alpha/lambda values is to determine the value
+of $\lambda_\max$, which is the smallest value of $\lambda$ that drives all coefficients
+to zero in a lasso model ($\alpha = 1$).
+
+For details on the algorithms for fitting elastic net models, see the article
+[Regularization Paths for Generalized Linear Models via Coordinate Descent](https://docs.google.com/viewer?url=https://www.jstatsoft.org/article/view/v033i01/v33i01.pdf) 
+by Friedman, Hastie, and Tibshirani in the Journal of Statistical Software.
+
+In Section 2.5 of the paper, note that in the case of an ordinary linear model,
+$\lambda_\max$ is given by 
+
+$$
+\lambda_\max= \frac{\max_\ell \left| \left\langle x_\ell, y \right\rangle \right|}{N\alpha}
+$$
+
+Here $\lambda_\max$ is for a specific value of $\alpha$. For simplicity, we will refer to 
+$\lambda_\max$ as the value such that coefficients go to zero for $\alpha = 1$ (i.e., lasso).
+
+If we call $\lambda_\max$ the value for $\alpha = 1$ and $\lambda_\max^\alpha$ the value for 
+general $\alpha$, we see that
+
+$$
+\lambda_\max^\alpha = \frac{\lambda_\max}{\alpha}.
+$$
+
+In the case of generalized linear model, $\lambda_\max$ can be expression in terms of deviance
+residuals, but this relationship still holds.
+
+Thus to get $\lambda_\max^\alpha$ for any value of $\alpha$, we only need to get it for a single
+value of $\alpha$. Here we will get the value $\lambda_\max$ for $\alpha = 1$.
+
+
+```{r lambda_max, results = "hide"}
+lambda_max_glm_args <- rutils::list_edit(
+  list(
+    x = .params$predictors,
+    y = .params$tgt_var,
+    training_frame = data_model_h2o,
+    weights_column = .params$wgt_var,
+    alpha = 1,
+    nlambdas = 1,
+    lambda_search = TRUE
+  ),
+  !!!.params$fit_pars
+) 
+
+lambda_max_model <- purrr::lift(h2o::h2o.glm)(lambda_max_glm_args)
+
+lambda_max <- lambda_max_model@parameters$lambda
+
+coef_universe <- lambda_max_model@model$coefficients_table %>%
+  as_tibble() %>%
+  select(names) %>%
+  filter(names != "Intercept") %>%
+  tidyr::separate(names, c("var", "level"), sep = "\\.", remove = FALSE) %>%
+  mutate(
+    level = coalesce(level, var),
+    var_grp = case_when(
+      stringr::str_detect(var, "^VehAge") ~ "VehAge",
+      stringr::str_detect(var, "^DrivAge") ~ "DrivAge",
+      stringr::str_detect(var, "^BonusMalus") ~ "BonusMalus",
+      stringr::str_detect(var, "^VehMaxSpeed") ~ "VehMaxSpeed",
+      stringr::str_detect(var, "^RiskVar") ~ "RiskVar",
+      TRUE ~ var
+    )
+  )
+
+h2o::h2o.rm(lambda_max_model)
+```
+
+# Model with no regularization
+
+For subsequent comparison to the regularized models, we will fit a model without
+any regularization.
+
+```{r model_noreg, results = "hide"}
+model_noreg_args <- rutils::list_edit(
+  list(
+    x = .params$predictors,
+    y = .params$tgt_var,
+    training_frame = data_model_h2o,
+    weights_column = .params$wgt_var,
+    lambda = 0,
+    fold_column = ".fold",
+    keep_cross_validation_predictions = TRUE
+  ),
+  !!!.params$fit_pars
+) 
+
+model_noreg <- purrr::lift_dl(h2o::h2o.glm)(model_noreg_args)
+
+model_noreg_output <- tibble(
+  alpha = NA_real_,
+  log_lambda = -Inf,
+  model = list(get_model_output(model_noreg))
+) %>%
+  tidyr::unnest_wider(model) %>%
+  tidyr::unnest_wider(metrics)
+
+h2o::h2o.rm(model_noreg)
+```
+
+
+# Alpha/lambda grid
+
+Now we construct our alpha/lambda grid. We will build the grid as follows.
+We specified a sequence of alpha values, along with the number of lambdas to
+use at each alpha.
+
+For each alpha value, we will get a sequence of the number of specified lambdas
+which is evenly spaced on the log scale, going from the lambda min ratio times
+$\lambda_\max$ to $\lambda_max$ (where $\lambda_\max$ is for that specific alpha value).
+
+```{r grid}
+grid_params <- tibble(
+  alpha = .params$alpha_seq,
+  lambda_max = lambda_max / pmax(alpha, 0.01),
+  lambda_min = if_else(alpha == 0, 0.1, 1) * .params$lambda_min_ratio * lambda_max,
+  log_lambda = purrr::map2(
+    lambda_min, lambda_max, 
+    ~seq(log(.x), log(.y), length.out = .params$nlambda)
+  ),
+  width = (log(lambda_max) - log(lambda_min)) / (.params$nlambda - 1)
+) %>%
+  tidyr::unnest(log_lambda)
+```
+
+# Fit models on grid
+
+Next we fit cross-validated models at each alpha/lambda combination on our grid.
+We will compute the area under Lorenz curve, Cramer-von Mises distance between
+actual and predicted loss distributions, and variance of predicted values on the 
+cross-validated predictions.
+
+```{r model_grid_search, results = "hide"}
+grid_model_output <- grid_params %>%
+  mutate(
+    model = purrr::pmap(
+      list(alpha, log_lambda), 
+      compute_grid_search_model,
+      data_h2o = data_model_h2o,
+      predictors = .params$predictors,
+      tgt_var = .params$tgt_var,
+      wgt_var = .params$wgt_var,
+      fit_args = .params$fit_pars
+    )
+  ) %>% 
+  tidyr::unnest_wider(model) %>% 
+  tidyr::unnest_wider(metrics)
+```
+
+# Metric variance estimates
+
+At each point on our grid, we have computed model metrics, so we can evaluate which performed
+best. However, we want to know how significant of a difference there is between metric values.
+To get at this, we will compute a sort of estimate of the number of standard deviations by which
+the value of a metric at a grid point is below the best metric value.
+
+In order to do this, we will first get an estimate of the variance in the metric value at the optimal
+point. We will find the grid point with the optimal value of area under Lorenz curve of Cramer-von Mises
+distance, then fit 10 more sets of cross-validated predictions with different random fold assignments.
+We will compute the metrics on each of these sets of predictions, then calculate the variance in the metric values.
+
+These variance estimates will then be used to compute an estimated "drop" number of standard errors
+of the value of each metric at each grid point compared to the best value for that metric.
+
+One can then choose an optimal grid point as, say, the point with the lowest sum of Lorenz AUC drop and
+Cramer-von Mises distance drop (or according to some weighting where one metric is given more weight
+than the other, depending on what one wishes to optimize).
+
+```{r metric_var_est, results = "hide"}
+fold_metric_var <- purrr::map(
+  1:10, ~sample.int(10, nrow(data_model), replace = TRUE)
+) %>%
+  rlang::set_names(paste0(".fold", 1:10)) %>%
+  as_tibble()
+
+fold_metric_var_h2o <- h2o_import_fast(fold_metric_var)
+
+data_model_h2o_metric_var <- h2o::h2o.cbind(data_model_h2o, fold_metric_var_h2o)
+
+lorenz_top <- grid_model_output %>%
+  arrange(desc(lorenz_auc)) %>%
+  slice(1)
+
+lorenz_auc_var <- purrr::map(
+  paste0(".fold", 1:10),
+  function(fold) {
+    compute_grid_search_model(
+      alpha = lorenz_top$alpha,
+      log_lambda = lorenz_top$log_lambda,
+      data_h2o = data_model_h2o_metric_var,
+      predictors = .params$predictors,
+      tgt_var = .params$tgt_var,
+      wgt_var = .params$wgt_var,
+      fit_args = .params$fit_pars,
+      fold_col = fold
+    )
+  }
+)
+
+lorenz_auc_cv_sd <- lorenz_auc_var %>%
+  purrr::map_dbl(purrr::pluck, "metrics", "lorenz_auc") %>%
+  sd()
+
+grid_model_output_auc_drop <- grid_model_output %>%
+  mutate(lorenz_auc_drop_sd = (max(lorenz_auc) - lorenz_auc) / lorenz_auc_cv_sd) 
+
+dist_top <- grid_model_output_auc_drop %>%
+  filter(percent_rank(lorenz_auc_drop_sd) <= 0.25) %>%
+  arrange(prem_dist) %>%
+  slice(1)
+
+prem_dist_var <- purrr::map(
+  paste0(".fold", 1:10),
+  function(fold) {
+    compute_grid_search_model(
+      alpha = dist_top$alpha,
+      log_lambda = dist_top$log_lambda,
+      data_h2o = data_model_h2o_metric_var,
+      predictors = .params$predictors,
+      tgt_var = .params$tgt_var,
+      wgt_var = .params$wgt_var,
+      fit_args = .params$fit_pars,
+      fold_col = fold
+    )
+  }
+)
+
+prem_dist_cv_sd <- prem_dist_var %>%
+  purrr::map_dbl(purrr::pluck, "metrics", "prem_dist") %>%
+  sd()
+
+grid_model_output <- grid_model_output_auc_drop %>%
+  mutate(
+    prem_dist_drop_sd = (prem_dist - min(prem_dist)) / prem_dist_cv_sd,
+    drop_combined = lorenz_auc_drop_sd + prem_dist_drop_sd
+  )
+
+h2o::h2o.rm(list(fold_metric_var_h2o, data_model_h2o_metric_var))
+```
+
+```{r grid_metrics_for_plot}
+grid_ll <- grid_model_output %>%
+  summarise(
+    range = diff(range(log_lambda)), 
+    min = min(log_lambda)
+  )
+
+grid_metrics_plot <- bind_rows(
+  grid_model_output,
+  model_noreg_output %>%
+    mutate(
+      alpha = 0,
+      log_lambda = grid_ll$min - 0.1 * grid_ll$range, 
+      width = grid_ll$range * 0.05
+    )
+)
+```
+
+# Area under Lorenz curve
+
+Here we plot the value of the area under the Lorenz curve at each point of the 
+alpha/lambda grid. We also plot the log of the difference between the maximum Lorenz area and that 
+of the cell. This is visualizing the same thing, but may help illustrate
+results better in some instances.
+
+At the bottom left (corresponding to alpha of 0 and a low value of lambda), the result from the model
+with no regularization is plotted. It can be seen that regularization can improve
+performance on this metric.
+
+```{r grid_plot_lorenz}
+ggplot(data = grid_metrics_plot) + 
+  theme_minimal() +
+  geom_tile(
+    aes(
+      x = log_lambda,
+      y = alpha,
+      fill = lorenz_auc,
+      width = width
+    )
+  ) +
+  viridis::scale_fill_viridis(direction = -1, option = "C") +
+  scale_y_continuous(breaks = .params$alpha_seq) +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    legend.title = element_blank()
+  ) + 
+  ggtitle("Area under Lorenz curve", subtitle = "Higher is better") +
+  xlab(expression(log(lambda))) + 
+  ylab(expression(alpha))
+
+ggplot(data = grid_metrics_plot) + 
+  theme_minimal() +
+  geom_tile(
+    aes(
+      x = log_lambda,
+      y = alpha,
+      fill = log(max(lorenz_auc) - lorenz_auc + lorenz_auc_cv_sd),
+      width = width
+    )
+  ) +
+  viridis::scale_fill_viridis(direction = 1, option = "C") +
+  scale_y_continuous(breaks = .params$alpha_seq) +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    legend.title = element_blank()
+  ) + 
+  ggtitle(
+    "Area under Lorenz curve", 
+    subtitle = glue::glue(
+      "Log of difference between maximum area and that of cell",
+      "\n(more negative is better)"
+    )
+  ) +
+  xlab(expression(log(lambda))) + 
+  ylab(expression(alpha))
+```
+
+# Difference between predicted and actual distributions
+
+Now we plot the Cramer-von Mises distance between the actual and predicted loss distributions
+at each grid point. Similarly to the Lorenz curve area plots, we also plot the log of the
+Cramer-von Mises statistic, which may make the visualization of results more vivid.
+
+As previously, at the bottom left
+(corresponding to alpha of 0 and a low value of lambda), the result from the model
+with no regularization is plotted. It can be seen that regularization can improve
+performance on this metric.
+
+
+```{r grid_plot_cvm}
+ggplot(data = grid_metrics_plot) + 
+  theme_minimal() +
+  geom_tile(
+    aes(
+      x = log_lambda, 
+      y = alpha, 
+      fill = prem_dist,
+      width = width
+    )
+  ) +
+  viridis::scale_fill_viridis(direction = 1, option = "C") +
+  scale_y_continuous(breaks = .params$alpha_seq) +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    legend.title = element_blank()
+  ) + 
+  ggtitle(
+    "Difference between predicted loss distribution and\nactual loss distribution", 
+    subtitle = "Cramer-von Mises statistic (lower is better)"
+  ) +
+  xlab(expression(log(lambda))) + 
+  ylab(expression(alpha))
+
+
+ggplot(data = grid_metrics_plot) + 
+  theme_minimal() +
+  geom_tile(
+    aes(
+      x = log_lambda, 
+      y = alpha, 
+      fill = log(prem_dist),
+      width = width
+    )
+  ) +
+  viridis::scale_fill_viridis(direction = 1, option = "C") +
+  scale_y_continuous(breaks = .params$alpha_seq) +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    legend.title = element_blank()
+  ) + 
+  ggtitle(
+    "Difference between predicted loss distribution and\nactual loss distribution", 
+    subtitle = "Log of Cramer-von Mises statistic (lower is better)"
+  ) +
+  xlab(expression(log(lambda))) + 
+  ylab(expression(alpha))
+```
+
+# Amount of segmentation
+
+Here we plot the weighted standard deviation of predicted values (weighted by exposure)
+at each alpha/lambda grid point. This can be seen as a sort of measure of the amount of
+segmentation generated by a model.
+
+```{r grid_plot_sd}
+ggplot(data = grid_metrics_plot) + 
+  theme_minimal() +
+  geom_tile(
+    aes(
+      x = log_lambda, 
+      y = alpha,
+      fill = sqrt(var), 
+      width = width
+    )
+  ) +
+  viridis::scale_fill_viridis(direction = -1, option = "C") +
+  scale_y_continuous(breaks = .params$alpha_seq) +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    legend.title = element_blank()
+  ) +
+  ggtitle(
+    "Weighted standard deviation of predictions", 
+    subtitle = "Higher means more segmentation"
+  ) +
+  xlab(expression(log(lambda))) + 
+  ylab(expression(alpha))
+```
+
+# Table of metrics on grid
+
+The following table provides the results of all the metrics calculated at
+each point on the alpha/lambda grid.
+
+```{r grid_metrics_table}
+grid_model_output %>%
+  arrange(drop_combined, lorenz_auc_drop_sd, prem_dist_drop_sd, desc(var)) %>%
+  transmute(
+    Alpha = alpha,
+    Lambda = exp(log_lambda),
+    `Log lambda` = log_lambda,
+    `Lorenz AUC` = lorenz_auc,
+    `AUC drop (std deviations)` = lorenz_auc_drop_sd,
+    `Predicted/actual difference (Cramer-von Mises)` = prem_dist,
+    `Predicted/actual drop (std deviations)` = prem_dist_drop_sd,
+    `Variance of predictions` = var,
+    `Combined AUC/distance drop` = drop_combined
+  ) %>%
+  DT::datatable(
+    extensions = "FixedColumns",
+    rownames = FALSE,
+    options = list(
+      fixedColumns = list(leftColumns = 2),
+      scrollX = TRUE
+    ),
+    width = "auto",
+    height = "auto"
+  ) %>%
+  DT::formatRound(
+    c("Lambda", "Log lambda"), 
+    digits = 4
+  ) %>%
+  DT::formatRound(
+    c("Lorenz AUC", "Predicted/actual difference (Cramer-von Mises)"), 
+    digits = 6
+  ) %>%
+  DT::formatRound(
+    "Variance of predictions", 
+    digits = 2
+  ) %>%
+  DT::formatRound(
+    c("AUC drop (std deviations)", 
+      "Predicted/actual drop (std deviations)", 
+      "Combined AUC/distance drop"),
+    digits = 3
+  )
+```
+
+# Regularization paths
+
+In this section, we plot the full regularization paths for each variable
+in the model. Model terms have been logically grouped and plotted together 
+(i.e., categorical levels are plotted together; all transformations/versions
+of a numeric variable are grouped and plotted together). The regularization
+path is plotted for each value of alpha. On each alpha facet, the vertical
+line corresponds to the value of lambda that was the best-performing model
+(defined here as the model with the smallest sum of drops in 
+Lorenz AUC and Cramer-von Mises distance)
+for that value of alpha.
+
+```{r plot_reg_paths, fig.height = 7, results = "asis"}
+coef_path_by_var <- grid_model_output %>%
+  select(alpha, log_lambda, coef) %>%
+  tidyr::unnest(coef) %>%
+  inner_join(coef_universe, by = "names") %>%
+  tidyr::nest(coef_df = c(-var_grp))
+
+optimal_lambda <- grid_model_output %>% 
+  group_by(alpha) %>% 
+  filter(row_number(drop_combined) == 1) %>%
+  ungroup()
+
+purrr::pwalk(
+  as.list(coef_path_by_var),
+  function(coef_df, var_grp, lambda_lines) {
+    plot <- plot_regularization_path(coef_df, var_grp, lambda_lines)
+    cat("##", var_grp, "\n\n")
+    print(plot)
+    cat("\n\n")
+  },
+  lambda_lines = optimal_lambda
+)
+```
+
+
+```{r h2o_shutdown, include = FALSE}
+rm(list = setdiff(ls(), ".params"))
+gc()
+h2o::h2o.shutdown(FALSE)
+```
+
+
