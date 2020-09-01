@@ -1,0 +1,614 @@
+---
+title: "A simulation-based investigation of deductible offsets in modeling"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+```
+
+# Introduction
+
+In this document we investigate the use of deductible offsets for both frequency and
+pure premium models.
+
+```{r load_pkg}
+library(dplyr)
+library(tweedie)
+library(statmod)
+```
+
+We simulated 1 million policy observations. There are two predictor variables
+for each policy: `x1` and `x2`. There are five deductible values: 100, 250, 500,
+1000, and 2500.
+
+The variables `x1` and `x2` are simulated as independent standard normal random variables.
+
+Two different choices of deductible are considered:
+
+1. A purely random choice of deductible, where each of the five choices is equally likely.
+
+2. The deductible is correlated to the value of `x1.` Policies with higher values
+of `x1` are more likely to have higher deductibles. Overall, lower deductibles are more common.
+
+```{r sim_data}
+set.seed(5000)
+
+n_pol <- 1000000
+deductibles <- c(100, 250, 500, 1000, 2500)
+
+pol_data_sim <- tibble(
+  id = 1:n_pol,
+  x1 = rnorm(n_pol),
+  x2 = rnorm(n_pol),
+  deduct_purely_random = sample(deductibles, n_pol, replace = TRUE),
+  deduct_correlated = deductibles[ceiling(5 * rbeta(n_pol, shape1 = exp(x1), shape2 = 3))]
+)
+```
+
+For a given simulation of policy losses and deductible choices, we do the following 
+estimation. We compute two empirical deductible based: a claim count elimination ratio
+and a loss dollar elimination ratio.
+
+We then fit multiple frequency and pure premium models, using the log of the claim count and 
+loss elimination ratios as offsets.
+
+```{r fn_fit}
+fit_models <- function(pol_data, claim_data, deductibles) {
+  claim_data_agg <- claim_data %>%
+    group_by(id) %>%
+    summarise_at(vars(loss:loss_net_ded_gu), sum) %>%
+    rename(n_claims_above_ded = above_ded)
+  
+  deduct_factors_empirical <- purrr::map2_dfr(
+    deductibles[-1], 
+    deductibles[-length(deductibles)],
+    function(ded, ded_lag, data) {
+      data %>% 
+        filter(loss > deductible, deductible <= ded_lag) %>%
+        summarise(
+          dollar_ratio =  mean(pmax(0, loss - ded)) / mean(pmax(0, loss - ded_lag)),
+          cnt_ratio = sum(loss > ded) / sum(loss > ded_lag)
+        ) %>%
+        transmute(deductible = ded, dollar_ratio, cnt_ratio)
+    },
+    data = claim_data
+  ) %>%
+    add_row(
+      deductible = deductibles[1],
+      dollar_ratio = 1,
+      cnt_ratio = 1,
+      .before = 1
+    ) %>%
+    mutate_at(vars(ends_with("ratio")), cumprod)
+  
+  pol_data_model <- pol_data %>%
+    left_join(claim_data_agg, by = "id") %>%
+    mutate_at(vars(loss:loss_net_ded_gu), ~coalesce(as.numeric(.), 0)) %>%
+    left_join(deduct_factors_empirical, by = "deductible")
+  
+  freq_models <- tribble(
+    ~target, ~offset, ~model,
+    "Claim count (actual)", "None", 
+    glm(
+      n_claims ~ x1 + x2,
+      family = "poisson", 
+      data = pol_data
+    ),
+    "Claim count (above deductible)", "None",
+    glm(
+      n_claims_above_ded ~ x1 + x2,
+      family = "poisson", 
+      data = pol_data_model
+    ),
+    "Claim count (above deductible)", "Count elimination ratio",
+    glm(
+      n_claims_above_ded ~ x1 + x2 + offset(log(cnt_ratio)),
+      family = "poisson", 
+      data = pol_data_model
+    ),
+    "Claim count (above deductible)", "Loss elimination ratio",
+    glm(
+      n_claims_above_ded ~ x1 + x2 + offset(log(dollar_ratio)),
+      family = "poisson", 
+      data = pol_data_model
+    )
+  )
+  
+  pp_models <- tribble(
+    ~target, ~offset, ~model,
+    "Loss (actual)", "None",
+    glm(
+      loss ~ x1 + x2, 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
+    "Loss net of deductible", "None",
+    glm(
+      loss_net_ded ~ x1 + x2, 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
+    "Loss net of deductible", "Count elimination ratio",
+    glm(
+      loss_net_ded ~ x1 + x2 + offset(log(cnt_ratio)), 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
+    "Loss net of deductible", "Loss elimination ratio",
+    glm(
+      loss_net_ded ~ x1 + x2 + offset(log(dollar_ratio)), 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
+    "Loss net of deductible, ground-up", "Count elimination ratio",
+    glm(
+      loss_net_ded_gu ~ x1 + x2 + offset(log(cnt_ratio)), 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
+    "Loss net of deductible, ground-up", "Loss elimination ratio",
+    glm(
+      loss_net_ded_gu ~ x1 + x2 + offset(log(dollar_ratio)), 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    )
+  )
+  
+  list(
+    freq = freq_models %>%
+      mutate(coef = purrr::map(model, coef)) %>%
+      tidyr::unnest_wider(coef) %>%
+      select(-model), 
+    pp = pp_models %>%
+      mutate(coef = purrr::map(model, coef)) %>%
+      tidyr::unnest_wider(coef) %>%
+      select(-model) 
+  )
+}
+```
+
+```{r fn_print}
+print_models_gt <- function(results, int, x1, x2) {
+  results %>%
+    mutate(type = "Models") %>%
+    add_row(type = "Actual", `(Intercept)` = int, x1 = x1, x2 = x2) %>%
+    group_by(type) %>%
+    gt::gt() %>% 
+    gt::fmt_number(3:5, decimals = 4) %>%
+    gt::fmt_missing(columns = 1:5, missing_text = "")
+}
+```
+
+# Scenario 1: Poisson-gamma, frequency a function of variables, severity constant
+
+In our first simulation scenario, we simulate claims from a Poisson-gamma mixture.
+Claim counts are simulated from a Poisson distribution, where the Poisson rate
+$\lambda$ is a function of `x1` and `x2`.
+
+Loss amounts are independent of claim counts and are independent and
+identically distributed from a gamma distribution with shape parameter 2 and
+scale parameter 1000.
+
+## Deductible purely random
+
+```{r poisgam_freq_fn_sev_con_ded_rand}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_purely_random) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3 + 0.1 * x1 + 0.2 * x2))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(nrow(.), shape = 2, scale = 1000),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_1 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_1$freq, int = -3.0, x1 = 0.1, x2 = 0.2)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_1$pp, int = log(2000) - 3, x1 = 0.1, x2 = 0.2)
+```
+
+
+## Deductible correlated
+
+```{r poisgam_freq_fn_sev_con_ded_cor}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_correlated) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3 + 0.1 * x1 + 0.2 * x2))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(nrow(.), shape = 2, scale = 1000),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_2 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_2$freq, int = -3.0, x1 = 0.1, x2 = 0.2)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_2$pp, int = log(2000) - 3, x1 = 0.1, x2 = 0.2)
+```
+
+## Discussion
+
+Note: the first line shown in the tables, the "Claim count (actual)" and 
+"Loss (actual)" targets, cannot be estimated in practice, as we are assuming
+we only have information on losses exceeding the deductible. These are included
+for illustrative and comparative purposes.
+
+Note: when we refer to "loss net of deductible, ground-up", we mean the ground-up
+loss in the case where the loss exceeded the deductible (loss net of deductible +
+deductible), and 0 when the loss was less than the deductible. That is,
+the loss net of deductible if we treat the deductible like a franchise deductible.
+
+When deductibles are purely random and not correlated with the predictors,
+estimated coefficients of `x1` and `x2` are not hugely impacted in
+either the frequency of pure premium model.
+
+In the case where the deductible is correlated with `x1`, the estimate of `x1`
+is significantly thrown off in both the frequency and pure premium models.
+
+In the frequency model, using the claim count elimination ratio as the offset
+best corrects the estimate of `x1` (as well as the estimate of the intercept).
+
+For the pure premium model, using the loss elimination ratio as the offset and
+the loss net of deductible (not ground-up) as the target provides the best
+estimate of `x1`.
+
+# Scenario 2: Poisson-gamma, frequency constant, severity a function of variables
+
+In our second scenario, we again simulate from a Poisson-gamma mixture.
+This time, the Poisson frequency is constant across policies, with 
+$\lambda = \exp(-3)$. Severity is simulated from a gamma distribution,
+where the mean severity is a function of `x1` and `x2`.
+
+## Deductible purely random
+
+```{r poisgam_freq_con_sev_fn_ded_rand}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_purely_random) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(
+      nrow(.), 
+      shape = 2,
+      scale = exp(8 + 0.1 * x1 + 0.2 * x2) / 2
+    ),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_3 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_3$freq, int = -3.0, x1 = 0, x2 = 0)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_3$pp, int = 5, x1 = 0.1, x2 = 0.2)
+```
+
+## Deductible correlated
+
+```{r poisgam_freq_con_sev_fn_ded_cor}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_correlated) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(
+      nrow(.), 
+      shape = 2,
+      scale = exp(8 + 0.1 * x1 + 0.2 * x2) / 2
+    ),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_4 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_4$freq, int = -3.0, x1 = 0.1, x2 = 0.2)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_4$pp, int = log(2000) - 3, x1 = 0.1, x2 = 0.2)
+```
+
+## Discussion
+
+Compared to the previous case, when the deductible is purely random,
+the estimates of `x1` and `x2` are shifted a bit more. 
+
+In the correlated deductible case, as before, the estimates of `x1` and
+`x2` are substantially impacted.
+
+For frequency, using the claim count elimination ratio provides the best
+correction, and for pure premium, using the loss net of deductible as the
+target and loss elimination ratio as the offset provides the best correction.
+
+
+# Scenario 3: Poisson-gamma, frequency and severity both function of variables
+
+In this scenario, we again simulate from a Poisson-gamma mixture. This time,
+the means of both frequency and severity are functions of `x1` and `x2`.
+
+
+## Deductible purely random
+
+```{r poisgam_freq_fn_sev_fn_ded_rand}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_purely_random) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3 + 0.1 * x1 + 0.2 * x2))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(
+      nrow(.), 
+      shape = 2,
+      scale = exp(8 + 0.1 * x1 + 0.2 * x2) / 2
+    ),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_5 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_5$freq, int = -3.0, x1 = 0.1, x2 = 0.2)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_5$pp, int = 5, x1 = 0.2, x2 = 0.4)
+```
+
+
+## Deductible correlated
+
+```{r poisgam_freq_fn_sev_fn_ded_cor}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_correlated) %>%
+  mutate(
+    n_claims = rpois(nrow(.), lambda = exp(-3 + 0.1 * x1 + 0.2 * x2))
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    loss = rgamma(
+      nrow(.), 
+      shape = 2,
+      scale = exp(8 + 0.1 * x1 + 0.2 * x2) / 2
+    ),
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_6 <- fit_models(pol_data, claim_data, deductibles)
+```
+
+### Frequency
+
+```{r}
+print_models_gt(models_6$freq, int = -3.0, x1 = 0.1, x2 = 0.2)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_6$pp, int = 5, x1 = 0.2, x2 = 0.4)
+```
+
+## Discussion
+
+As in previous cases, estimates are affected more when deductibles are correlated
+than when they are not.
+
+For frequency, using the claim count elimination ratio provides the best 
+results. For pure premium, it's a bit of a toss-up between
+using loss net of deductible as target and loss elimination ratio as offset
+and using loss net of deductible, ground-up as target and claim count 
+elimination ratio as offset.
+
+# Scenario 4: Tweedie
+
+In our last scenario, we simulate losses from a Tweedie distribution. Recall
+that a Tweedie distribution is a special case of a Poisson-gamma mixture
+with a particular constraint on the parameter space.
+
+Also recall that Tweedie distributions imply that frequency and severity are 
+positively correlated.
+
+In this case, we only fit pure premium models.
+
+## Deductible purely random
+
+```{r tweedie_ded_rand}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_purely_random) %>%
+  mutate(
+    loss = rtweedie(nrow(.), p = 1.33, phi = 650, mu = exp(5 - 0.35 * x1 + 0.12 * x2)),
+    n_claims = as.numeric(loss > 0)
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_7 <- fit_models(
+  pol_data %>% select(-loss),
+  claim_data,
+  deductibles
+)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_7$pp, int = 5, x1 = -0.35, x2 = 0.12)
+```
+
+
+## Deductible correlated
+
+```{r tweedie_ded_cor}
+pol_data <- pol_data_sim %>%
+  select(id, x1, x2, deductible = deduct_correlated) %>%
+  mutate(
+    loss = rtweedie(nrow(.), p = 1.33, phi = 650, mu = exp(5 - 0.35 * x1 + 0.12 * x2)),
+    n_claims = as.numeric(loss > 0)
+  )
+
+claim_data <- pol_data %>%
+  slice(rep(1:nrow(.), times = n_claims)) %>%
+  mutate(
+    above_ded = loss > deductible,
+    loss_net_ded = pmax(0, loss - deductible),
+    loss_net_ded_gu = if_else(above_ded, loss, 0)
+  ) 
+
+models_8 <- fit_models(
+  pol_data %>% select(-loss),
+  claim_data,
+  deductibles
+)
+```
+
+### Pure premium
+
+```{r}
+print_models_gt(models_8$pp, int = 5, x1 = -0.35, x2 = 0.12)
+```
+
+## Discussion
+
+As in previous cases, estimates are affected more significantly 
+when the deductible is correlated with the `x1` predictor than 
+when it is uncorrelated.
+
+As in the previous case, the best correction is a bit of toss-up between
+the loss net of deductible target and loss elimination ratio offset
+and the loss net of deductible ground-up target and count elimination
+ratio offset.
+
+In the correlated deductible case, the loss net of deductible, loss elimination
+ratio offset undershoots in correcting, while
+the loss net of deductible ground-up, count elimination ratio offsets overshoots
+past the actual values.
+
+# More discussion
+
+In the case of frequency models, using the claim count elimination ratio
+makes sense theoretically, and in our study here we confirmed that using
+this offset provided the best results in frequency models.
+
+In general, we observed estimates for the pure premium deviate from the true 
+simulated parameters, even in the purely random deductible case. This was 
+more pronounced in the Poisson-gamma mixture cases where severity 
+was also a function of the predictors.
+
+One hypothesis is that this is related to the implicit relationship between
+frequency and severity required by the Tweedie distribution with the 
+constrained parameter space implied by the Tweedie distribution.
+
+This also may be why neither the offset based on the claim count elimination
+ratio nor the offset based on the loss elimination ratio optimally corrected
+estimates back to the "true" values. 
+
+When loss net of deductible was the target, the deductible offsets did not provide
+enough correction back to actual, but the loss elimination ratio produced 
+better results than the claim count elimination ratio.
+
+When loss net of deductible ground-up was the target, the deductible offsets 
+over-corrected past actual, but the claim count elimination ratio produced better
+results than the loss elimination ratio.
+
+A speculation as to potential intuition behind this is in the loss net of deductible
+case (e.g., loss net of ordinary deductible), the deductible impact 
+is proportionately more due to the loss dollar elimination. However, with loss
+net of deductible ground-up (e.g., loss net of franchise deductible), we've added back
+loss dollars on claims exceeding the deductible, so the deductible elimination
+is more on account of "count" elimination below the deductible.
+
+Again, this is highly imprecise and nebulous speculation, and this is a topic that
+requires further investigation. Further investigation could include examining
+more simulated scenarios and a deeper look at the performance of
+claim count elimination ratio vs loss elimination ratio offsets is ordinary deductible
+vs. franchise deductible targets.
+
+
