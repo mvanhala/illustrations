@@ -1,0 +1,210 @@
+---
+title: "On centroids of Zip Code Tabulation Areas"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+library(dplyr)
+library(leaflet)
+library(sf)
+
+aea_proj <- glue::glue(
+  "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 ",
+  "+x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=km"
+)
+```
+
+# Spatial analysis based on ZIP codes
+
+The use of ZIP codes is ubiquitous in spatial-based analysis of data. 
+This is because of their ease of use and implementation, as they are an inherent part
+of addresses collected from customers or other entities, so they can be generally be 
+assured to be well-populated and accurate. 
+
+Note that there are many problems with using ZIP codes, and if possible 
+[alternatives should be used](https://carto.com/blog/zip-codes-spatial-analysis/).
+
+For this document, however, we will work within the framework of wanting to use ZIP codes.
+
+# ZIP codes vs. Zip Code Tabulation Areas
+
+One consideration to note with respect to analysis of ZIP codes is that ZIP codes do not represent polygons. They are collections of postal delivery routes for the convenience of mail delivery by the United States Postal Service. The Postal Service does not provide freely available definitions or maps of the road segments and boundaries comprising ZIP codes.
+
+However, the United States Census Bureau maintains something called the ZIP Code Tabulation Area (ZCTA), which the Census Bureau describes as ["generalized areal representations"](https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html) of USPS ZIP codes. ZCTAs do not correspond exactly with ZIP codes. There is a many-to-many relationship between them, as ZIP codes cross Census block, Census tract, county, and even state boundaries. The Census Bureau creates ZCTAs by first assigning Census blocks to the most common ZIP code for addresses within that Census block, with further subsequent steps to assign unassigned blocks.
+
+While ZCTAs are not ZIP codes, due to their availability, convenience, and reasonable approximation of ZIP code boundaries, we will treat ZIP codes and ZCTAs as interchangeable for the purpose of this document.
+
+# Types of centroids
+
+Suppose we wish to perform some analysis on ZIP code-level data, and we wish to treat it as a point mass at the centroid of the ZCTA. What centroid do we use? 
+
+There are two natural ways to conceive of the centroid. One is the geographic center of area of a ZCTA, and the other is the [center of population](https://www.census.gov/data/tables/2010/dec/center-pop-text.html), the point at which an "imaginary, flat, weightless and rigid map of the United States would balance perfectly if all residents were of identical weight".
+
+# Estimating centers of population for ZCTAs
+
+One issue in trying to use centers of population is that while the Census Bureau computes and publishes centers of population for many units of analysis (state, county, census tract, and census block), it does not do so ZCTAs.
+
+However, we can approximate centers of population for ZCTAs ourselves based on census blocks using the following method. 
+
+1. For each ZCTA, find all 2010 Census blocks intersecting that ZCTA.
+
+2. For each intersecting Census block, compute the area of the intersection of the ZCTA and census block, then approximate the population of that Census block subset within the ZCTA as the total block population multiplied by the ratio of the block/ZCTA intersection area to the total block area.
+
+3. At this point, we have the collection of Census blocks covering the ZCTA and the estimated population of each Census block within a ZCTA. Finally, approximate the ZCTA center of population as the average of the Census block area-weighted centroids weighted by population.
+
+# Map of area-weighted vs population-weighted ZCTA centroids in Florida
+
+The file [zcta_centers_of_population.R] contains code for applying the process described in the previous section to calculate ZCTA centers of population.
+
+The following map shows simplified ZCTA polygon boundaries, along with area-weighted and population-weighted centroid points, for the state of Florida.
+
+```{r, fig.height = 7}
+zcta_fl <- sfcensus::zcta_sf %>%
+  filter(state_abb == "FL") %>%
+  rmapshaper::ms_simplify(keep = 0.05, keep_shapes = TRUE, sys = TRUE) %>%
+  sf::st_buffer(0)
+
+centroid_pal <- colorFactor(
+  palette = c("Orange", "Blue"), 
+  domain = c("Center of area", "Center of population")
+)
+
+centroid_pop_fl <- readRDS("data/derived/zcta_centers_of_population.rds") %>%
+  filter(state_abb == "FL") %>%
+  mutate(type = "Center of population")
+
+centroid_area_fl <- sfcensus::zcta_sf %>%
+  filter(state_abb == "FL") %>%
+  st_transform(aea_proj) %>%
+  st_centroid() %>%
+  st_transform(4326) %>%
+  mutate(type = "Center of area")
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Voyager") %>% 
+  addPolylines(data = zcta_fl, weight = 1, color = "black") %>%
+  addCircleMarkers(
+    data = bind_rows(centroid_pop_fl, centroid_area_fl),
+    color = ~centroid_pal(type),
+    fillColor = ~centroid_pal(type),
+    fillOpacity = 0.5,
+    radius = 4,
+    weight = 0.5
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = centroid_pal,
+    values = c("Center of area", "Center of population"),
+    opacity = 0.8
+  )
+```
+
+
+# Specific example: ZIP code 85365 in Arizona
+
+As an example of the difference between area-weighted and populated-weighted centroids, let's consider ZCTA 85365 in Yuma, Arizona.
+
+ZCTA 85365 contains part of the city of Yuma, along with sections of uninhabited Arizona desert.
+
+In the following map, the ZCTA boundary is in red. The boundaries of the intersecting Census blocks are in blue. 
+The area-weighted centroids of the intersecting Census blocks are shown in green, where the area of the marker is
+proportional to the population count. We observe the vast majority of the population lies in the vicinity of Yuma, while
+most of the area is sparsely inhabited or uninhabited desert.
+
+```{r}
+zcta_85365 <- sfcensus::zcta_sf %>% 
+  filter(zcta == "85365") %>%
+  st_transform(aea_proj)
+
+az_block <- read_sf("data/blocks/AZ") %>%
+  st_transform(aea_proj)
+
+zcta_85365_blocks <- az_block %>%
+  mutate(block_area = st_area(.)) %>%
+  st_intersection(zcta_85365) %>%
+  mutate(
+    intersect_area = st_area(.),
+    pop_est = units::set_units(POP10 * intersect_area / block_area, NULL)
+  ) 
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Voyager") %>%
+  addPolylines(
+    data = zcta_85365_blocks %>%
+      st_collection_extract("POLYGON") %>%
+      st_transform(4326),
+    weight = 1
+  ) %>%
+  addCircleMarkers(
+    data = zcta_85365_blocks %>%
+      filter(pop_est >= 1) %>%
+      st_centroid() %>%
+      st_transform(4326),
+    radius = ~0.5 * sqrt(POP10),
+    weight = 0,
+    color = "green",
+    fillOpacity = 0.6
+  ) %>%
+  addPolylines(
+    data = zcta_85365 %>%
+      st_transform(4326),
+    color = "red",
+    weight = 2
+  ) 
+```
+
+The next map shows the area-weighted and population-weighted centroids. We see the area-weighted
+centroid lies in the middle of the uninhabited desert, while the population-weighted centroid
+lies in the vicinity of the city of Yuma.
+
+```{r}
+leaflet() %>%
+  addProviderTiles("CartoDB.Voyager") %>% 
+  addCircleMarkers(
+    data = bind_rows(
+      zcta_85365 %>%
+        st_centroid() %>%
+        st_transform(4326) %>%
+        mutate(type = "Center of area"), 
+      readRDS("data/derived/zcta_centers_of_population.rds") %>%
+        filter(zcta == "85365") %>%
+        mutate(type = "Center of population")
+    ),
+    color = ~centroid_pal(type),
+    fillColor = ~centroid_pal(type),
+    fillOpacity = 0.5,
+    radius = 4,
+    weight = 0.5
+  ) %>%
+  addPolylines(
+    data = zcta_85365 %>%
+      st_transform(4326),
+    color = "red",
+    weight = 2
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = centroid_pal,
+    values = c("Center of area", "Center of population"),
+    opacity = 0.8
+  )
+```
+
+
