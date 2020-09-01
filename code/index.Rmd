@@ -1,0 +1,232 @@
+---
+title: "Examples of analysis related to spatial analysis, modeling, insurance, and other topics"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+# Introduction
+
+The [mvanhala/illustrations](https://github.com/mvanhala/illustrations) repo contains documents
+and scripts related to a few different topics. Many are related to spatial analysis, and
+many have direct or indirect applications to the insurance context.
+
+# Zip Code Tabulation Area centers of population
+
+In 
+[On centroids of Zip Code Tabulation Areas](zcta_centroids/zcta_centroids.html),
+we look at estimating centers of population for Census Zip Code
+Tabulation Areas using population counts for 2010 Census blocks.
+We contrast population-weighted and area-weighted centroids.
+
+# Cropland data
+
+In the script 
+[code/cropland_data_layer.R](https://github.com/mvanhala/illustrations/blob/master/code/cropland_data_layer.R),
+we download [Cropscape](https://nassgeodata.gmu.edu/CropScape/) data
+on [US crop cover](https://www.nass.usda.gov/Research_and_Science/Cropland/sarsfaqs2.php).
+
+We create a map of 
+[crop cover in South Dakota](south_dakota_cropland.html) 
+from 2016 to 2019. It is a leaflet map with several layers that can be toggled.
+The viewer can see a part of the state (southeast South Dakota) at the original
+30 meter raster cell granularity, 
+or the whole state at an aggregated 300 meter cell granularity.
+The few most common crops in South Dakota are displayed.
+Rotation between corn and soybeans is readily apparent when toggling between years.
+
+One can envision applications of this data to problems in crop insurance, such as 
+comparing the similarity of crops in a given field to those within various neighborhoods.
+
+# Wildfire data
+
+In 
+[code/mtbs_wildfire.R](https://github.com/mvanhala/illustrations/blob/master/code/mtbs_wildfire.R),
+we look at wildfire perimeter data downloaded from the US multiagency program
+[Monitoring Trends in Burn Severity](https://www.mtbs.gov/).
+
+We rasterized the wildfire polygons over the 35 years of data, then created a
+[map](mtbs_historical_wildfire.html)
+displaying the number of years a wildfire occurred at each cell in the 
+western United States.
+The map also has a very simple smoothed version of the wildfire frequency.
+The simple smoothing is obviously not a realistic model of wildfire propensity,
+as it is affected by terrain and urban density. However, one could 
+refine the analysis of the historical wildfire perimeter data to inform
+analyses of wildfire risk.
+
+# Methods for spatial interpolation
+
+In 
+[An exploration of methods for spatial interpolation](spatial_interpolation.html),
+we explore six methods for spatial interpolation: nearest neighbor,
+triangulation, natural neighbor, thin plate splines, inverse distance weighting,
+and ordinary kriging. We apply these methods to an example of interpolating
+precipitation on a hexagonal grid (and then to Zip Code Tabulation Areas)
+from values at irregularly located weather stations west of the Mississippi River.
+
+# Spatial clustering and optimization
+
+In
+[Spatial-based clustering and optimization](optimization_assignment_problem.html),
+we perform a basic exploration of possible techniques for problems of spatial-based
+clustering and optimization.
+
+Our motivating example is splitting up a region into territories to be handled by 
+different response teams. We use a simplified problem on wildfire location data
+to demonstrate how to apply an
+[assignment problem](https://en.wikipedia.org/wiki/Assignment_problem) combinatorial optimization to
+such a question.
+
+# Examples of data manipulation and reshaping
+
+In 
+[Data manipulation and reshaping with dplyr, data.table, dtplyr, tidyr, and tidyfast](data_operation_examples/data_manipulation_reshaping.html),
+we compare and contrast how to perform standard data manipulation operations
+using `dplyr` with local data frames, `dplyr` on a SQL backend, 
+`dplyr` on a `data.table` backend via `dtplyr`,
+and `data.table` directly. We also compare basic reshaping
+operations with `tidyr` vs. the `data.table`-based `tidyfast`.
+
+The data used for this illustration was daily 
+[Local Climatological Data](https://www.ncdc.noaa.gov/data-access/land-based-station-data/land-based-datasets/quality-controlled-local-climatological-data-qclcd)
+for a selection of cities. The script
+[code/data_operation_examples/save_lcd_data.R](https://github.com/mvanhala/illustrations/blob/master/code/data_operation_examples/save_lcd_data.R)
+downloads this data.
+
+# Interpreting model relativities
+
+In [On interpreting factor relativities](interpreting_factors.html), 
+we examine potential pitfalls and misunderstandings when interpreting a set of
+model factor relativities.
+
+We also suggest a potential metric for better quantifying the segmentation provided
+by a variable.
+
+# Deductible offsets in modeling
+
+In
+[A simulation-based investigation of deductible offsets in modeling](deductible_offsets.html),
+we compare the use of different deductible offsets in fitting insurance pricing models.
+Specifically, we compare the performance of
+claim count elimination ratio and loss dollar elimination ratio offsets
+under scenarios where deductible amounts are uncorrelated with predictors or are
+correlated with predictors.
+
+
+# Semiparametric analysis of increased limit factors
+
+In 
+[A method for semiparametric estimation of increased limit factors](ilf/method_ilf_semiparametric.html),
+we explore a simulation-based method for estimating increased limit factors in which we 
+estimate the distribution of "small" losses nonparametrically with the Kaplan-Meier estimator
+and "large" losses parametrically (using a Pareto distribution in the example).
+
+We apply this method to a simulated set of personal auto claims which have individual and 
+aggregate deductibles (i.e., a claimant deductible and an aggregate claim deductible).
+
+
+# Model metrics
+
+In
+[Exploring metrics for evaluating and comparing models](model_metrics.html),
+we explore potential intuitive-type metrics for evaluating and comparing models,
+particularly focused on regression problems in an insurance context with heavily-skewed
+data for a pricing model.
+
+The metrics we focus on are the area under a Lorenz curve as a measure of directional 
+segmentation and the Cramer-von Mises distance between actual and predicted loss distributions
+as a measure of how well-calibrated the predictive distribution is.
+
+We discuss the advantages and disadvantages of these metrics, get a hands-on look
+with some example, and cast some metrics as continuous version analogues of
+metrics one might get from a decile lift chart.
+
+# Fitting elastic net GLMs with a grid search
+
+In
+[Fitting elastic net models with a grid search](elastic_net_models/elastic_net_grid_search.html),
+we fit elastic net GLMs on a sample dataset of auto insurance policies.
+
+We perform a grid search on the $\alpha$ and $\lambda$ elastic net parameters, and have 
+some discussion on the elastic net model and penalty.
+
+We use the metrics discussed in the model metrics notebook (area under Lorenz curve,
+Cramer-von Mises distance between predicted and actual loss distributions) to
+compare model performance. We also plot the full regularization paths of
+coefficients along the sequence of lambdas for each value of alpha used in the grid search.
+
+# Deploying insurance pricing models as Plumber APIs
+
+In 
+[Example of pricing model deployment via Plumber API](plumber/plumber_model_deployment.html),
+we discuss an example of deploying an insurance pricing via a Plumber API.
+This document details the files in the folder
+[code/plumber](https://github.com/mvanhala/illustrations/tree/master/code/plumber),
+including defining the input structure, the pricing function code,
+programmatic generation of the OpenAPI specification, and deployment within
+a Docker container.
+
+# Running R jobs in AWS EC2 worker instances
+
+The 
+[mvanhala/awsjobs](https://github.com/mvanhala/awsjobs)
+repo is an R package to enable running R scripts or R Markdown documents
+in AWS EC2 worker instances.
+
+The `illustrations` repo has a
+[folder](https://github.com/mvanhala/illustrations/tree/master/code/aws_worker_jobs)
+with code for programmatically creating an AMI 
+(via the [`paws`](https://github.com/paws-r/paws) AWS SDK for R)
+to use in running jobs with `awsjobs`.
+
+The [pages for awsjobs](https://mvanhala.github.io/awsjobs/) reference this image 
+creation example and have more documentation and explanation of how the
+`awsjobs` package works.
+
+# Geospatial analysis in other repos
+
+The repo [mvanhala/geospatial_data_sources](https://github.com/mvanhala/geospatial_data_sources)
+contains code for downloading and extracting data from several different geospatial data sources, 
+and for using this data to enrich other spatial data sets.
+
+The repo [mvanhala/nexrad_hail_data](https://github.com/mvanhala/nexrad_hail_data)
+contains code for a 
+[document on Level III NEXRAD hail data](https://mvanhala.github.io/nexrad_hail_data/nexrad.html).
+
+# Custom R packages
+
+There are a couple of custom R packages you will see references in the 
+code in the `illustrations`. These are:
+
+* [mvanhala/rutils](https://github.com/mvanhala/rutils): a collection of helpful R function for tasks
+like rendering R Markdown documents in a clean `callr` session, more flexible ways 
+to save htmlwidgets, detecting dependencies in package code and updating DESCRIPTION files,
+and a function for editing/modifying lists. The `rutils` package has a 
+`pkgdown` [pages site](https://mvanhala.github.io/rutils/) documenting the package.
+
+* [mvanhala/sfcensus](https://github.com/mvanhala/sfcensus/): an R data package with several 
+US Census spatial data sets. The `sfcensus` package has a `pkgdown` 
+[pages site](https://mvanhala.github.io/sfcensus/) documenting the package.
+
+# Environment
+
+Within this repo, we are using [renv](https://github.com/rstudio/renv) for R package management.
+You can initialize/restore the R package environment on your own machine, assuming you have the
+required system dependencies installed, in order to run these documents
+yourself as long as you have the 
+[lockfile](https://github.com/mvanhala/illustrations/blob/master/renv.lock) 
+and run `renv::init()`.
+
+
+
