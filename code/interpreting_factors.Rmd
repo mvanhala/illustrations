@@ -1,0 +1,533 @@
+---
+title: "On interpreting factor relativities"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%")
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+```
+
+```{r}
+print_dt <- function(df, opts = list(), extensions = character(0), scrollX = TRUE, ...) {
+  if (scrollX) {
+    opts[["scrollX"]] <- TRUE
+  }
+  
+  DT::datatable(
+    df,
+    rownames = FALSE,
+    extensions = extensions,
+    options = opts,
+    width = "auto",
+    height = "auto",
+    ...
+  )
+}
+```
+
+This document addresses pitfalls in thinking about and interpreting factor relativities
+in an insurance rating algorithm. Some of the pitfalls discussed are elementary, while
+others may be more subtle.
+
+We also think about ways to move toward an improved method for quantifying the 
+segmentation provided by a variable.
+
+Throughout this document, we consider the example of relativities for a credit score
+variable, where the credit score may assume any integer value in the range from 200 to 900.
+
+# Basic pitfall: differences in factor values are not invariant to base levels, but ratios are
+
+A naive metric one might think of for describing the segmentation, conceptualized as the 
+"spread", provided by a factor is the subtraction between the highest and lowest values of the factor.
+
+In a multiplicative rating structure, additive differences are not useful to consider. One should
+always think in terms of *ratios* between factor values, not additive differences.
+
+Let's consider three versions of a credit score factor.
+
+```{r}
+tribble(
+  ~range, ~v1, ~v2, ~v3,
+  "200 - 300", 7, 3.5, 1.75,
+  "300 - 400", 6, 3, 1.5,
+  "400 - 500", 5, 2.5, 1.25,
+  "500 - 600", 4, 2, 1,
+  "600 - 700", 3, 1.5, 0.75,
+  "700 - 800", 2, 1, 0.5,
+  "800 - 900", 1, 0.5, 0.25
+) %>%
+  print_dt(
+    class = "cell-border", 
+    opts = list(dom = "t"),
+    colnames = c("Score range", "Version 1", "Version 2", "Version 3")
+  ) %>%
+  DT::formatRound(2:4)
+```
+
+In version 1, the range 800-900 is the base level. In version 2, 700-800 is the base level; and
+in version 3, 500-600 is the base level.
+
+```{r}
+pitfall_base_level <- tibble(
+  score = 200:900
+) %>%
+  mutate(
+    `Version 1` = stepfun(seq(300, 800, by = 100), seq(7, 1, by = -1))(score),
+    `Version 2` = stepfun(seq(300, 800, by = 100), seq(3.5, 0.5, by = -0.5))(score),
+    `Version 3` = stepfun(seq(300, 800, by = 100), seq(1.75, 0.25, by = -0.25))(score)
+  ) %>%
+  pivot_longer(c(-score), names_to = "version", values_to = "factor")
+
+ggplot(data = pitfall_base_level) + 
+  theme_minimal() + 
+  geom_step(aes(x = score, y = factor, color = version)) +
+  scale_color_manual(values = pals::glasbey(3)) +
+  theme(axis.title = element_blank(), legend.title = element_blank()) + 
+  ggtitle("Three versions of an equivalent set of factors")
+```
+
+With version 3, the base rate is set to two times the base rate for version 2, which
+is two times the base rate of version 1.
+
+Would it make sense to calculate the "segmentation" of these different factors by taking
+the difference between the highest and lowest levels? That is, we would get 7 - 1 = 6 for
+version 1, 3 for version 2, and 1.5 for version 3.
+
+No. These three versions are all equivalent. The three curves are simply scaled versions of each
+other. Version 2 is one-half times Version 1, and Version 3 is one-fourth times Version 1.
+The final calculated premiums are identical, as the differences due to factor scales resulting
+from base level selection get cancelled out in the base rates.
+
+If we rebase all of them to a common base level, we observe that there are identical.
+
+```{r}
+pitfall_base_level_rebased <- pitfall_base_level %>%
+  mutate(
+    factor_rebased = case_when(
+      version == "Version 1" ~ factor / 3,
+      version == "Version 2" ~ factor / 1.5,
+      version == "Version 3" ~ factor / 0.75
+    )
+  )
+
+ggplot(data = pitfall_base_level_rebased) + 
+  theme_minimal() + 
+  geom_step(aes(x = score, y = factor_rebased, linetype = version), alpha = 0.5) +
+  scale_color_manual(values = pals::glasbey(3)) +
+  theme(axis.title = element_blank(), legend.title = element_blank()) + 
+  ggtitle("Previous factors rebased to a base level of 600-700")
+```
+
+Notice that if instead of taking the difference between the largest and smallest factors,
+we took the ratio as our measure of "spread"/"segmentation", all three version are identical
+(7 / 1 = 3.5 / 0.5 = 1.75 / 0.25 = 7).
+
+What is the lesson here? Within a multiplicative rating structure, 
+if you are comparing different versions of factors of one
+variable, if one wants to think about the "spread" of a variable
+in terms of the range between the highest and lowest values, 
+one must compute the ratio between the highest and lowest values, not the
+subtraction difference.
+
+Also, the choice of base level does not matter. The ratio between different factor
+values is not affected by the choice of base level.
+
+## Sub-pitfall: differences still not valid to consider after rebasing to a common base level
+
+One might ask whether, if we rebase different versions of factors for a variable to a common
+base level, could we then compare the segmentation by computing the subtraction differences
+between the highest and lowest levels.
+
+The answer is still no.
+
+Consider two versions of a variable, Version 2 from above and a new version called Version 4.
+
+```{r}
+tribble(
+  ~range, ~v2, ~v4,
+  "200 - 300", 3.5, 4,
+  "300 - 400", 3, 3.2,
+  "400 - 500", 2.5, 2.4,
+  "500 - 600", 2, 1.8,
+  "600 - 700", 1.5, 1.2,
+  "700 - 800", 1, 0.9,
+  "800 - 900", 0.5, 0.8
+) %>%
+  print_dt(
+    class = "cell-border", 
+    opts = list(dom = "t"),
+    colnames = c("Score range", "Version 2", "Version 4")
+  ) %>%
+  DT::formatRound(2:3)
+```
+
+Here is a plot comparing these two versions.
+
+```{r}
+pitfall_base_level <- tibble(
+  score = 200:900
+) %>%
+  mutate(
+    `Version 2` = stepfun(seq(300, 800, by = 100), seq(3.5, 0.5, by = -0.5))(score),
+    `Version 4` = stepfun(seq(300, 800, by = 100), c(4, 3.2, 2.4, 1.8, 1.2, 0.9, 0.8))(score)
+  ) %>%
+  pivot_longer(c(-score), names_to = "version", values_to = "factor")
+
+ggplot(data = pitfall_base_level) + 
+  theme_minimal() + 
+  geom_step(aes(x = score, y = factor, color = version)) +
+  scale_color_manual(values = pals::glasbey(2)) +
+  theme(axis.title = element_blank(), legend.title = element_blank()) + 
+  ggtitle("Two versions of a score variable")
+```
+
+The following table shows the versions of these factors under rebasing to two different base
+levels: 650 and 850.
+
+```{r}
+tribble(
+  ~range, ~v2, ~v4,
+  "200 - 300", 3.5, 4,
+  "300 - 400", 3, 3.2,
+  "400 - 500", 2.5, 2.4,
+  "500 - 600", 2, 1.8,
+  "600 - 700", 1.5, 1.2,
+  "700 - 800", 1, 0.9,
+  "800 - 900", 0.5, 0.8
+) %>%
+  mutate(
+    v2_rebase_650 = v2 / 1.5,
+    v2_rebase_850 = v2 / 0.5,
+    v4_rebase_650 = v4 / 1.2,
+    v4_rebase_850 = v4 / 0.8
+  ) %>%
+  print_dt(
+    class = "cell-border", 
+    opts = list(dom = "t"),
+    colnames = c(
+      "Score range", 
+      "V2", "V4",
+      "V2 (rebased 650)", "V2 (rebased 850)", 
+      "V4 (rebased 650)", "V4 (rebased 850)"
+    )
+  ) %>%
+  DT::formatRound(2:7)
+```
+
+Under the rebasing to 650, the subtraction difference for Version 2 is 2.33 - 0.33 = 2.00,
+and for Version 4 it is 3.33 - 0.67 = 2.67
+
+Under the rebasing to 850, the subtraction difference for Version 2 is 7.00 - 1.00 = 6.00,
+and for Version 4 it is 5.00 - 1.00 = 4.00.
+
+Not only is do the actual values of differences between Versions 2 and 4 change 
+between the 650 and 850 rebasing, but which version has a greater difference
+also changes! 
+Under 650 rebasing, Version 4 has a greater subtraction 
+difference between high and low values, but under 850 rebasing, Version 2 has a greater
+subtraction difference.
+
+However, when we look at ratios, the ratio between high and low values remains the same
+and is unaffected by choice of base level.
+
+For Version 2, the high/low ratio is (3.50 / 0.50 = 2.33 / 0.33 = 7.00 / 1.00 = 7), and 
+for Version 4, the high/low ratio is (4.00 / 0.80 = 3.33 / 0.67 = 5.00 / 1.00 = 5).
+
+To conclude on this basic pitfall, if you want to consider the "spread" of factors for
+a variable, make sure to use ratios in comparing levels, and also remember that the
+selected base level is *irrelevant*.
+
+# Pitfalls with the simple spread or number of unique values as measures of segmentation
+
+We've seen that in looking at "spread" in a set of factors, one must consider ratios.
+However, even when applied correctly, there are limitations to this metric as a
+measure of segmentation.
+
+Another metric we've seen applied as a measure of the degree of segmentation is the
+number of unique values for a factor. This, too, has major limitations.
+
+As we shall see, a significant reason for the limitations is they do not take into
+account the distribution of the variable in the universe of interest (the overall
+population or a subset thereof).
+
+## Sample credit score distribution
+
+Continuing with our credit score examples, the distribution of credit scores in the
+population is simulated as:
+
+$$
+Y \sim 200 + 700 * \textrm{Beta}(\alpha=15,\beta=5)
+$$
+
+This is, credit score and scaled and shifted from a beta distribution with parameters
+$\alpha = 15$ and $\beta = 5$. After simulating a draw, we round it to the nearest integer.
+
+The mean of (unrounded) credit scores is
+
+$$
+200 + 700 \frac{15}{15 + 20} = 725
+$$
+
+and the standard deviation is
+
+$$
+\sqrt{700^2\frac{(15)(5)}{(15 + 5)^2 (15 + 5 + 1)}} \approx 66.1
+$$
+
+We'll simulate a sample of 1 million observations from this distribution.
+
+The following is a histogram of the simulated sample.
+
+```{r}
+set.seed(400)
+score_sample <- tibble(
+  score = round(200 + 700 * rbeta(1000000, shape1 = 15, shape = 5))
+)
+
+plot_dist <- ggplot(data = score_sample) + 
+  geom_histogram(aes(x = score), binwidth = 1) +
+  theme_minimal() + 
+  theme(
+    axis.title = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank()
+  ) + 
+  scale_x_continuous(
+    breaks = seq(200, 900, by = 100),
+    limits = c(200, 900)
+  ) +
+  ggtitle("Simulated distribution of credit scores")
+plot_dist
+```
+
+This resembles a credit score distribution we see in internal data, which
+is left-skewed and where there is very little mass of the distribution on the 
+lower end.
+
+## Examples of credit score factor versions
+
+Let's consider examples of different versions of credit score factors.
+
+Note that we have rebased each version to have a base level of 750. That is, for
+a score of 750, the factor is 1.0 in each version.
+
+```{r}
+score_versions <- tibble(
+  score = 200:900,
+  `Version A` = stepfun(c(300, 400, 500, 600), c(8, 6, 4, 2, 1))(score),
+  `Version B` = stepfun(c(210, 300, 400, 500, 600, 890), c(10, 8, 6, 4, 2, 1, 0.5))(score),
+  `Version C` = approxfun(c(200, 900), c(1.07, 0.93))(score),
+  `Version D` = approxfun(c(200, 600, 850, 900), c(8, 1.1, 1, 0.5))(score),
+  `Version E` = stepfun(c(200, seq(600, 825, by = 25)), c(2.5, seq(2, 0.6, length.out = 10), 0.5))(score)
+)
+
+score_versions_reshaped <- score_versions %>%
+  pivot_longer(c(-score), names_to = "version", values_to = "factor") %>%
+  left_join(
+    filter(., score == 750) %>%
+      select(version, factor_base = factor),
+    by = c("version")
+  ) %>%
+  mutate(factor_rebased = factor / factor_base)
+```
+
+Here is a plot of all five versions on a single graph.
+
+```{r}
+plot_factor <- ggplot(data = score_versions_reshaped) + 
+  theme_minimal() + 
+  geom_step(aes(x = score, y = factor_rebased, color = version)) + 
+  scale_color_manual(values = pals::glasbey(n_distinct(score_versions_reshaped$version))) + 
+  theme(legend.title = element_blank(), axis.title = element_blank()) +
+  ggtitle("Different credit score factor versions") +
+  scale_x_continuous(
+    breaks = seq(200, 900, by = 100),
+    limits = c(200, 900)
+  ) +
+  scale_y_continuous(limits = c(0, 10))
+plot_factor
+```
+
+Next we see each on its own separate graph, where the axes are free to vary.
+
+```{r}
+ggplot(data = score_versions_reshaped) + 
+  theme_minimal() + 
+  geom_step(aes(x = score, y = factor)) + 
+  facet_wrap(~version, scales = "free_y") +
+  theme(axis.title = element_blank()) +
+  ggtitle("Different credit score factor versions", subtitle = "Faceted, free y-axis") +
+  scale_x_continuous(
+    breaks = c(250, 450, 650, 850),
+    limits = c(200, 900)
+  )
+```
+
+## Comparing measures of segmentation
+
+Intuitively, one can readily think of potential drawbacks with spread (high/low ratio)
+in that it is sensitive to outliers at the extreme of the distribution that may have 
+negligible impact overall. Simply making the values at the high and low points more extreme
+will increase this measure.
+
+Once can also think of drawbacks with number of distinct values as a metric. One could
+have a very large number of different values, but each of which are only negligibly different
+from each other.
+
+For each of the credit score versions, let's calculate the two metrics mentioned above, namely 
+the spread (high/low relativity ratio) and the number of distinct values.
+
+```{r}
+score_versions %>%
+  summarise_at(
+    vars(starts_with("Version")),
+    list(
+      `Spread` = ~max(.) / min(.), 
+      `# values` = n_distinct
+    )
+  ) %>%
+  pivot_longer(everything(), names_to = "version_metric", values_to = "value") %>%
+  separate(version_metric, c("Version", "metric"), sep = "_") %>%
+  pivot_wider(names_from = "metric", values_from = "value") %>%
+  print_dt(
+    class = "cell-border", 
+    opts = list(dom = "t")
+  ) %>%
+  DT::formatRound("Spread")
+```
+
+Versions B and D have high values on the spread metric, while Versions C and D
+have large number of distinct factor values. In contrast, Version E has
+comparatively "mediocre" values for the spread and number of values metrics.
+
+Does this imply Version E is inferior in capturing segmentation compared to the other
+variables, or that Version D, which has high levels of both spread and distinct values,
+is superior? No, it does not, as we shall discuss.
+
+First, let's stack the factor plot on top of the distribution of credit scores.
+
+```{r}
+wrap_plots(
+  plot_factor +
+    theme(
+      axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()
+      ),
+  plot_dist +
+    theme(plot.title = element_blank()),
+  ncol = 1,
+  heights = c(2, 1)
+)
+```
+
+Notice that most of the mass of the distribution of scores is in the 600s and 700s.
+More than 90% of the distribution is between 600 and 825.
+
+Hardly any of the distribution falls in low credit scores.
+
+If a version jacks up the factors at the lowest credit scores, this can ramp up the spread,
+but its overall impact on segmentation is negligible.
+
+Compare Version A and Version B. These two are identical, except in the ranges 200-210 (where
+Version B has a higher factor) and 890-900 (where Version B has a lower factor).
+
+Exaggerating the extremes in this way increases the spread from 8 for Version A to 20 for
+Version B. However, is there really any more meaningful segmentation provided by Version B?
+No. A negligible proportion of the population lies in these regions.
+
+Now think about Version C. This scores very highly on number of unique values, as it is a continuous
+linear interpolation over the entire range of scores. However, the range of values is very narrow.
+
+How about if we think about Version D? This, as a continuous linear interpolation, 
+has a high number of unique values, just like Version C, and it also has a high spread value.
+
+Does this make it ideal for segmentation? No. Let's compare it to Version E.
+
+Let's plot factors zoomed in on the scores in the range from 600 to 825, where the bulk
+of the population is.
+
+```{r}
+wrap_plots(
+  plot_factor +
+    theme(
+      axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()
+      ) +
+    coord_cartesian(xlim = c(600, 825), ylim = c(0, 2.4)),
+  plot_dist +
+    theme(plot.title = element_blank()) +
+    coord_cartesian(xlim = c(600, 825)),
+  ncol = 1,
+  heights = c(2, 1)
+)
+```
+
+Version D has a very slight change over this range, going from about 1.06 at 600 to 0.97 at 700.
+
+By contrast, Version E exhibits the largest degree of variation over this interval, where
+the bulk of the distribution is.
+
+# A potential better metric for quantifying segmentation
+
+Let's try to define an improved metric for quantifying the segmentation offered by a set of factors.
+
+Intuitively, we want something that gives more weight to variation where the bulk of the
+distribution lies. Perhaps we could compute the variance of the factor weighted by the
+population distribution? We also don't want the choice of base level to affect our
+calculated metric. Hence we want to normalize factors.
+
+Thus we'll define a simulation metric as the variance of the average-rebalanced factor 
+weighted by the population distribution. The average-rebalanced factor is the set of
+relativities rebalanced such that the average weighted by the population distribution is
+equal to 1.
+
+One can compute this for a set of observations (such as our simulated sample above) as follows:
+
+1. For each observation, get the corresponding factor relativity factor relativity.
+2. Calculate the average relativity over the data set.
+3. Divide the relativities by the average.
+4. Compute the variance of the rebalance relativity.
+5. Higher values mean higher segmentation. Lower values mean lower segmentation.
+
+When we do this for the simulated data set for each of the five versions, we get the following
+values for this measures.
+
+```{r}
+score_sample %>%
+  left_join(score_versions, by = "score") %>%
+  summarise_at(vars(-score), ~var(. / mean(.))) %>%
+  pivot_longer(everything(), names_to = "Version", values_to = "Segmentation measure") %>%
+  print_dt(
+    class = "cell-border", 
+    opts = list(dom = "t")
+  ) %>%
+  DT::formatRound(2, digits = 4)
+```
+
+Consistent with our intuitive discussion in the previous section, Version E has the highest
+value, implying the highest degree of segmentation by this measure, despite the fact
+that it had comparatively pedestrian values for high-low spread and number of distinct values.
+
+
