@@ -1,0 +1,1253 @@
+---
+title: "An exploration of methods for spatial interpolation"
+author: "`r Sys.getenv('R_NAME')`"
+date: "`r strftime(Sys.time(), '%B %e, %Y')`"
+knit: (function(inputFile, encoding) rutils::render_doc(inputFile))
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_float: 
+      smooth_scroll: false
+      collapsed: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%", fig.height = 6)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+.start_time <- Sys.time()
+```
+
+```{r pkg}
+library(dplyr)
+library(ggplot2)
+library(gstat)
+library(leaflet)
+library(sf)
+```
+
+# Introduction
+
+In this document we will explore methods for spatial interpolation. As a motivating
+example, we will consider a problem of interpolating climate data from an irregular
+grid of station locations to values by ZIP code.
+
+A natural source of climate-related variables to use are the 
+[1981-2010 climate normals](https://www.ncdc.noaa.gov/data-access/land-based-station-data/land-based-datasets/climate-normals/1981-2010-normals-data)
+produced by NOAA's National Centers for Environmental Information.
+These include many variables related to temperature and precipitation. 
+They are produced for a number of station locations.
+
+The climate normals are produced at a collection of station locations.
+Climate normals are not produced by ZIP code (or rather, Census Zip Code Tabulation
+Areas, as ZIP codes themselves are not geographic polygons, but rather, US Postal Service
+mail delivery routes, which the USPS does not publish).
+
+Thus, we want to somehow get a value for each variable by ZCTA based on the 
+values at the irregularly located collection of station locations.
+
+There are a couple of simple methods that immediately come to mind. One is
+to for each ZCTA take the average of stations within the ZCTA if there are stations
+within the ZCTA, and to take the value of the station closest to the ZCTA (or its centroid) 
+if there are no stations within the ZCTA. Another is a nearest neighbor
+approach, where a ZCTA gets the value of the $n$ stations closest to it (or its
+centroid).
+
+The approach we shall consider in this document is as follows. We will take the 
+station point data and interpolate to a hexagonal grid across the region of interest.
+The hexagonal grid will have fairly fine-grained resolution. We will assume that 
+values are constant within each hexagonal cell. We will get values by ZCTA by performing
+an area-weighted interpolation of hexagonal cells within a ZCTA.
+
+# Example
+
+## Data
+
+We downloaded precipitation data from a NOAA FTP server.
+
+See 
+
+    ftp://ftp.ncdc.noaa.gov/pub/data/normals/1981-2010/products/precipitation/ann-prcp-normal.txt
+    
+for the precipitation normals data, and see
+
+    ftp://ftp.ncdc.noaa.gov/pub/data/normals/1981-2010/station-inventories/allstations.txt
+
+for an inventory of stations.
+
+## Region
+
+As an example throughout this document, we will consider a region that 
+consists of a swath of Western and Central Washington, and we will consider
+predicting rainfall. We choose this region in order to include the Puget Sound region,
+which has interesting patterns to variation in local rainfall, as well
+as parts of the Cascade and Olympic Mountains, at which maximum rainfall occurs,
+and part of the much drier area east of the Cascades.
+
+```{r ex_region, results = "hide", class.source = "fold-show"}
+aea_proj_km <- glue::glue(
+  "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 ",
+  "+x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=km"
+)
+
+wa_region_ex <- sfcensus::place_sf %>%
+  filter(
+    state_abb == "WA",
+    name %in% c("Bellingham", "Port Angeles", "Aberdeen", "Walla Walla", "Colville")
+  ) %>%
+  st_union() %>%
+  st_transform(aea_proj_km) %>%
+  st_convex_hull() %>%
+  st_buffer(10)
+```
+
+```{r ex_region_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolylines(data = st_transform(wa_region_ex, 4326), weight = 2)
+```
+
+## Stations with precipitation data
+
+Let's take a look at the weather stations in this region which have precipitation data.
+
+```{r ex_stations, class.source = "fold-hide"}
+prcp_pal <- colorNumeric(viridis::viridis(100, direction = -1), domain = c(0, 100))
+
+add_prcp_legend <- function(map, 
+                            pal = prcp_pal, 
+                            values = c(0, 100),
+                            opacity = 0.8,
+                            title = "Annual<br>precipitation<br>(in.)",
+                            ...) {
+  map %>%
+    addLegend(
+      "bottomright",
+      pal = pal,
+      values = values,
+      opacity = opacity,
+      title = title,
+      ...
+    )
+}
+
+add_prcp_poly <- function(map, 
+                          data,
+                          pal = prcp_pal,
+                          opacity = 0.6,
+                          ...) {
+  map %>%
+    addPolygons(
+      data = st_transform(data, 4326), 
+      fillColor = ~pal(pmin(prcp, 100)),
+      color = ~pal(pmin(prcp, 100)),
+      weight = 1,
+      fillOpacity = opacity,
+      ...
+    )
+}
+
+read_annual <- function(path, col_name, adj = 1) {
+  readr::read_fwf(
+    path,
+    col_positions = readr::fwf_positions(
+      start = c(1, 19, 24),
+      end = c(11, 23, 24),
+      col_names = c("stnid", "value", "flag")
+    ),
+    col_types = readr::cols(value = "i", .default = "c")
+  ) %>%
+    mutate(
+      !!sym(col_name) := recode(
+        value,
+        `-9999` = NA_integer_,
+        `-8888` = NA_integer_, 
+        `-7777` = 0L,
+        `-6666` = NA_integer_, 
+        `-5555` = NA_integer_
+      ),
+      !!sym(col_name) := !!sym(col_name) / adj
+    )
+}
+precip <- read_annual("data/climate_normals/ann-prcp-normal.txt", "prcp", 100)
+
+stations <- readr::read_fwf(
+  "data/climate_normals/allstations.txt",
+  col_positions = readr::fwf_positions(
+    start = c(1, 13, 22, 32, 39, 42, 73, 77, 81, 87), 
+    end = c(11, 20, 30, 37, 40, 71, 75, 79, 85, 99),
+    col_names = c("id", "lat", "lon", "elev", "state", "name", 
+                  "gsnflag", "hcnflag", "wmoid", "method")
+  ),
+  col_types = readr::cols("lat" = "d", "lon" = "d", "elev" = "d", .default = "c")
+) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  left_join(
+    precip %>%
+      select(id = stnid, prcp),
+    by = "id"
+  ) %>%
+  filter(!is.na(prcp)) %>%
+  st_transform(aea_proj_km)
+
+stations_wa_region <- stations %>%
+  st_join(st_as_sf(wa_region_ex), left = FALSE)
+```
+
+```{r ex_stations_map, class.source = "fold-show"}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    data = st_transform(stations_wa_region, 4326), 
+    fillColor = ~prcp_pal(pmin(prcp, 100)),
+    color = ~prcp_pal(pmin(prcp, 100)),
+    weight = 1,
+    label = ~name,
+    labelOptions = labelOptions(textsize = "14px"),
+    fillOpacity = 0.8
+  ) %>%
+  addPolylines(
+    data = st_transform(wa_region_ex, 4326), 
+    weight = 2, 
+    color = "red"
+  ) %>%
+  add_prcp_legend(prcp_pal)
+```
+
+## Hexagonal grid
+
+We will create a hexagonal grid over the region, where the minimal radius of the
+hexagons is 5 km. When we go to compare performance, we will use a grid with a minimal
+hexagon radius of 2.5 km. We use a larger radius for the example for visual and 
+illustrative purposes.
+
+```{r ex_grid}
+wa_region_grid <- wa_region_ex %>%
+  st_make_grid(cellsize = c(10, 10), square = FALSE) %>%
+  st_as_sf() %>%
+  mutate(hex_id = 1:n()) %>%
+  rename(geometry = x)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolylines(data = st_transform(wa_region_grid, 4326), weight = 0.5) %>%
+  addPolylines(data = st_transform(wa_region_ex, 4326), weight = 2, color = "red") 
+```
+
+We will interpolate the precipitation data to the centers of the hexagonal cells.
+
+
+## ZCTA
+
+The last step will be an area-weighted interpolation from the hexagonal cells to ZCTAs.
+
+Here is a map of ZCTAs within this region.
+
+```{r ex_zcta}
+wa_region_zcta <- sfcensus::zcta_sf %>%
+  st_transform(aea_proj_km) %>%
+  st_join(st_as_sf(wa_region_ex), left = FALSE)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolylines(data = st_transform(wa_region_zcta, 4326), weight = 1) %>%
+  addPolylines(data = st_transform(wa_region_ex, 4326), weight = 2, color = "red")
+```
+
+
+# Methods for spatial interpolation
+
+Our first phase is to interpolate from the station point data to the hexagonal grid.
+
+We will consider six methods for spatial interpolation.
+
+* Nearest neighbor, based on Voronoi polygons
+
+* Interpolation based on a triangular irregular network
+
+* Natural neighbor interpolation
+
+* Thin plate splines
+
+* Inverse distance weighting
+
+* Ordinary kriging
+
+## Nearest neighbor (Voronoi polygons)
+
+The simplest method of interpolation is nearest neighbor via Voronoi polygons.
+
+[Voronoi polygons](https://en.wikipedia.org/wiki/Voronoi_diagram) partition a plane
+into polygons, where each polygon corresponds to a point and consists of the region
+that is closer to that point that any other point.
+
+For our example above, here is the set of Voronoi polygons.
+
+```{r method_voronoi}
+wa_voronoi <- stations_wa_region %>%
+  st_geometry() %>%
+  st_union() %>%
+  st_voronoi() %>%
+  st_collection_extract("POLYGON") %>%
+  st_as_sf() %>%
+  st_join(stations_wa_region)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(st_intersection(wa_voronoi, wa_region_ex)) %>%
+  add_prcp_legend()
+```
+
+When we interpolate to the hexagonal grid, we will perform an area-weighted
+interpolation from Voronoi polygons to hexagonal grid cells. A grid cell
+will have its value calculated as the area-weighted average of the Voronoi polygons
+contained within the cell.
+
+Note that in this case, we could just go directly from the Voronoi polygons to 
+an area-weighted interpolation of ZCTAs. We first go to the hexagonal grid for consistency
+with the other methods.
+
+```{r method_voronoi_pred}
+wa_region_voronoi_pred <- wa_region_grid %>%
+  st_intersection(wa_voronoi) %>%
+  mutate(area = units::set_units(st_area(.), NULL)) %>%
+  st_set_geometry(NULL) %>%
+  group_by(hex_id) %>%
+  summarise(prcp = sum(prcp * area) / sum(area))
+
+wa_region_grid_pred_voronoi <- wa_region_grid %>%
+  left_join(wa_region_voronoi_pred, by = "hex_id")
+```
+
+Here is the resulting interpolated hexagonal grid on our example region.
+
+```{r method_voronoi_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_voronoi) %>%
+  add_prcp_legend()
+```
+
+
+
+## Triangulation
+
+In the next interpolation approach, we treat the set of stations as a
+[triangular irregular network](https://en.wikipedia.org/wiki/Triangulated_irregular_network).
+
+We first get a triangulation of the stations.
+
+```{r method_tri}
+wa_triangulate <- stations_wa_region %>%
+  st_geometry() %>%
+  st_union() %>%
+  st_triangulate() %>%
+  st_collection_extract("POLYGON") %>%
+  st_as_sf() %>%
+  rename(geometry = x)
+```
+
+```{r method_tri_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = st_transform(wa_triangulate, 4326), weight = 1)
+```
+
+Each of the polygons in the triangulation is a triangle. Each vertex is one
+of the station locations. To interpolate within triangles, we need to
+get the precipitation value associated with each vertex.
+
+First we get a data frame of station coordinates and values.
+
+```{r method_tri_coord}
+station_wa_coord_prcp <- stations_wa_region %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  mutate(prcp = stations_wa_region$prcp)
+```
+
+We then extract the coordinates of the three vertices of each triangle
+and join on the station precipitation values based on the coordinates.
+
+The following data frame contains a row for each triangle, where
+each row has the coordinates of the three vertices and the precipitation
+value at each vertex.
+
+```{r method_tri_values}
+wa_triangle_values <- wa_triangulate %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  distinct(row = L2, X, Y) %>%
+  group_by(row) %>%
+  mutate(point = 1:n()) %>%
+  left_join(station_wa_coord_prcp, by = c("X", "Y")) %>%
+  ungroup() %>%
+  tidyr::pivot_wider(
+    names_from = point,
+    values_from = c(X, Y, prcp), 
+    names_glue = "pt{point}_{.value}"
+  )
+
+wa_triangulate_prcp <- bind_cols(wa_triangulate, wa_triangle_values)
+
+wa_triangulate_prcp
+```
+
+Now we want to interpolate to the center of each hexagonal grid cell.
+First we find the triangle in which each cell center lies.
+
+```{r method_tri_cell}
+wa_region_triangles <- wa_region_grid %>%
+  st_centroid() %>%
+  st_join(wa_triangulate_prcp) %>%
+  bind_cols(
+    st_coordinates(.) %>%
+      as_tibble() %>%
+      rename(cell_X = X, cell_Y = Y)
+  )
+```
+
+To interpolate within a triangle, we need to calculate weights to assign
+to each of the three vertices.
+
+We will [interpolate using barycentric coordinates](https://codeplea.com/triangular-interpolation),
+where weights are calculated as follows. The coordinates of the three vertices
+are denoted $(X_1, Y_1)$, $(X_2, Y_2)$, and $(X_3, Y_3)$, and the coordinates of the point at
+which to interpolate is $(P_X, P_Y)$. The weights assigned to points 1, 2, and 3, are denoted
+as $w_1$, $w_2$, and $w_3$, respectively.
+
+$$
+w_1 = \frac{(Y_2 - Y_3) (P_X - X_3) + (X_3 - X_2) (P_Y - Y_3)}{(Y_2 - Y_3) (X_1 - X_3) + (X_3 - X_2) (Y_1-Y_3)}
+$$
+
+$$
+w_2 = \frac{(Y_3 - Y_1) (P_X - X_3) + (X_1 - X_3) (P_Y - Y_3)}{(Y_2 - Y_3) (X_1 - X_3) + (X_3 - X_2) (Y_1-Y_3)}
+$$
+
+$$
+w_3 = 1 - w_1 - w_2
+$$
+
+```{r method_tri_int}
+wa_region_triangle_int <- wa_region_triangles %>%
+  mutate(
+    pt1_wt = ((pt2_Y - pt3_Y) * (cell_X - pt3_X) + (pt3_X - pt2_X) * (cell_Y - pt3_Y)) /
+      ((pt2_Y - pt3_Y) * (pt1_X - pt3_X) + (pt3_X - pt2_X) * (pt1_Y - pt3_Y)),
+    pt2_wt = ((pt3_Y - pt1_Y) * (cell_X - pt3_X) + (pt1_X - pt3_X) * (cell_Y - pt3_Y)) /
+      ((pt2_Y - pt3_Y) * (pt1_X - pt3_X) + (pt3_X - pt2_X) * (pt1_Y - pt3_Y)),
+    pt3_wt = 1 - pt1_wt - pt2_wt,
+    cell_value = pt1_wt * pt1_prcp + pt2_wt * pt2_prcp + pt3_wt * pt3_prcp
+  )
+```
+
+Some points fall outside the triangulated region. For these, we will use the value interpolated
+by the Voronoi nearest neighbor method.
+
+```{r method_tri_pred}
+wa_region_triangle_pred <- wa_region_triangle_int %>%
+  st_set_geometry(NULL) %>%
+  as_tibble() %>%
+  left_join(
+    wa_region_voronoi_pred %>% 
+      rename(prcp_voronoi = prcp), 
+    by = "hex_id"
+  ) %>%
+  transmute(hex_id, prcp = coalesce(cell_value, prcp_voronoi))
+```
+
+Here are the values interpolated on the hexagonal grid based on the triangulation method.
+
+```{r method_tri_pred_map}
+wa_region_grid_pred_triangle <- wa_region_grid %>%
+  left_join(wa_region_triangle_pred, by = "hex_id")
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_triangle) %>%
+  add_prcp_legend()
+```
+
+## Natural neighbor
+
+In [natural neighbor interpolation](https://en.wikipedia.org/wiki/Natural_neighbor_interpolation),
+we recalculate the Voronoi polygons after adding the point to be interpolated.
+
+We compare the recalculated Voronoi polygons to the original Voronoi polygons, and when looking
+at the Voronoi polygon for the point to be interpolated, see how much area it took from the original
+Voronoi polygons. The interpolated value is then the area-weighted average of the 
+values of the polygons from which the new polygon took area.
+
+Let's look at a specific example to make this more clear.
+
+Suppose we want to interpolate a point near Carnation, WA.
+
+```{r method_natnbr_carnation}
+carnation_center <- sfcensus::place_sf %>%
+  filter(state_abb == "WA", name == "Carnation") %>%
+  st_transform(aea_proj_km) %>%
+  st_centroid() %>%
+  select(geometry)
+```
+
+First we get a new set of Voronoi polygons after adding this new point.
+We extract the polygon for this new point.
+
+```{r method_natnbr_carnation_poly}
+carnation_poly <- stations_wa_region %>%
+  bind_rows(carnation_center) %>%
+  st_geometry() %>%
+  st_union() %>%
+  st_voronoi() %>%
+  st_collection_extract("POLYGON") %>%
+  st_as_sf() %>%
+  st_join(carnation_center, left = FALSE)
+```
+
+Now let's get the polygons on the original set of Voronoi polygons with which
+the new Carnation polygon intersects.
+
+```{r method_natnbr_carnation_intersect}
+carnation_poly_intersect <- wa_voronoi %>%
+  st_join(carnation_poly, left = FALSE)
+```
+
+In the following map, the Voronoi polygon for Carnation is shaded in red,
+and the Carnation point location is the red marker.
+The original Voronoi polygons with which the new Carnation polygon intersects
+are shaded in light blue on the map. The light blue markers are the station
+locations to which those Voronoi polygons belong.
+
+```{r method_natnbr_carnation_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    data = st_transform(carnation_poly_intersect, 4326), 
+    weight = 1, 
+    fillOpacity = 0.05
+  ) %>%
+  addPolygons(
+    data = st_transform(carnation_poly, 4326),
+    weight = 2, 
+    color = "red", 
+    fillOpacity = 0.3
+  ) %>%
+  addCircleMarkers(
+    data = stations_wa_region %>%
+      semi_join(
+        st_set_geometry(carnation_poly_intersect, NULL), 
+        by = "id"
+      ) %>%
+      st_transform(4326), 
+    fillOpacity = 0.2, 
+    weight = 1,
+    label = ~name,
+    labelOptions = labelOptions(textsize = "14px")
+  ) %>%
+  addCircleMarkers(
+    data = st_transform(carnation_center, 4326), 
+    color = "red", 
+    weight = 1, 
+    fillOpacity = 0.5,
+    label = "Kirkland",
+    labelOptions = labelOptions(textsize = "14px")
+  )
+```
+
+To interpolate a value for Auburn, we first calculate the areas of the 
+intersections between the Auburn polygon and all the original polygons with which 
+the Auburn polygon intersects. For illustration, we will also calculate the weight
+as the ratio of the intersection area to the total area of the Auburn polygon.
+
+```{r method_natnbr_carnation_calc_1}
+carnation_poly %>%
+  st_intersection(wa_voronoi) %>%
+  select(id, elev, state, name, prcp) %>%
+  mutate(
+    area = st_area(.), 
+    weight = round(units::set_units(area / sum(area), NULL), 5)
+  )
+```
+
+Finally, we calculated the interpolated precipitation for Auburn as the
+area-weighted precipitation of the intersecting polygons.
+
+```{r method_natnbr_carnation_calc_2}
+carnation_poly %>%
+  st_intersection(wa_voronoi) %>%
+  select(id, elev, state, name, prcp) %>%
+  mutate(
+    area = st_area(.), 
+    weight = round(units::set_units(area / sum(area), NULL), 5)
+  ) %>%
+  st_set_geometry(NULL) %>%
+  summarise(prcp = sum(weight * prcp))
+```
+
+An advantage of [natural neighbor interpolation](https://github.com/gwlucastrig/Tinfour/wiki/Introduction-to-Natural-Neighbor-Interpolation) 
+is that it provides a smoother
+and often more accurate approximate that simple nearest neighbor interpolation.
+
+A disadvantage is that it is more computationally intensive than nearest neighbor
+or triangulation-based interpolation. In the simplest formulation, one must recalculate
+the Voronoi diagram for every single point to be interpolated, then find the intersection
+with the original Voronoi diagram. Faster and more efficient algorithms for performing
+natural neighbor interpolation have been 
+[proposed](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.174.2191&rep=rep1&type=pdf),
+but a search did not readily turn up any open-source implementations of some
+algorithms proposed in the literature, so we will just use the simple approach
+of calculating a new Voronoi diagram for each point to be interpolated. We will parallelize
+interpolation of points across multiple child processes to help speed up 
+execution time where helpful. We will also reduce the size of the Voronoi diagram we need
+to recalculate by first filtering to stations within 200 km of the point to be interpolated.
+
+Let's perform natural neighbor on the hexagonal grid in our example.
+
+```{r method_natnbr_run}
+wa_nat_nbr_proc <- purrr::map(
+  wa_region_grid %>% 
+    st_centroid() %>% 
+    group_split(0:(n() - 1) %% 4, keep = FALSE),
+  function(pts, data, mask) {
+    callr::r_bg(
+      function(pts, data, mask) {
+        library(dplyr)
+        library(sf)
+        
+        get_nat_nbr_int <- function(pt_sf, data, mask) {
+          voronoi_close <- data %>%
+            filter(as.numeric(st_distance(., pt_sf)) <= 200) %>%
+            bind_rows(pt_sf) %>%
+            st_geometry() %>%
+            st_union() %>%
+            st_voronoi() %>%
+            st_collection_extract("POLYGON") %>%
+            st_as_sf() 
+          
+          voronoi_intersect <- voronoi_close %>%
+            st_join(pt_sf, left = FALSE) %>%
+            st_intersection(mask) %>%
+            mutate(area = units::set_units(st_area(.), NULL))
+          
+          voronoi_intersect %>%
+            st_set_geometry(NULL) %>%
+            summarise(prcp = sum(area * prcp) / sum(area))
+        }
+        pts %>%
+          purrrlyr::by_row(get_nat_nbr_int, data = data, mask = mask, .to = "interpolated") %>%
+          tidyr::unnest_wider(interpolated)
+      },
+      args = list(pts = pts, data = data, mask = mask)
+    )
+  },
+  data = stations_wa_region, 
+  mask = wa_voronoi
+)
+purrr::walk(wa_nat_nbr_proc, ~.$wait())
+
+wa_region_nat_nbr_pred <- purrr::map_dfr(wa_nat_nbr_proc, ~.$get_result()) %>%
+  select(hex_id, prcp)
+```
+
+Here is the resulting interpolated hexagonal grid on our example region from 
+the natural neighbor interpolation.
+
+```{r method_natnbr_map}
+wa_region_grid_pred_nat_nbr <- wa_region_grid %>%
+  left_join(wa_region_nat_nbr_pred, by = "hex_id")
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_nat_nbr) %>%
+  add_prcp_legend()
+```
+
+
+## Thin plate spline
+
+The next method we will consider for interpolation is the 
+[thin plate spline](https://en.wikipedia.org/wiki/Thin_plate_spline)
+which is a spline-based method that fits a smooth surface to a set of points.
+It minimized a penalized sum of squares, where the penalty increases with the "wiggliness"
+of the surface (defined in terms of the second derivative of the surface).
+
+We will use the `Tps` function in the `fields` package to fit thin plate splines.
+
+Here we fit a thin plate spline and view the interpolated values on the hexagonal grid 
+for our example.
+
+```{r method_tps}
+wa_region_tps <- fields::Tps(st_coordinates(stations_wa_region), stations_wa_region$prcp)
+wa_region_grid_pred_tps <- wa_region_grid %>%
+  mutate(prcp = predict(wa_region_tps, st_coordinates(st_centroid(wa_region_grid)))[, 1])
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_tps) %>%
+  add_prcp_legend()
+```
+
+## Inverse distance weighting
+
+We will now consider [inverse distance weighting](https://en.wikipedia.org/wiki/Inverse_distance_weighting).
+
+In inverse distance weighting (IDW), a point is interpolated by taking the closest $n$ observations
+to that point, computing the distances between the $n$ observations and the point to be interpolated,
+and weighting the $n$ observations proportionally to the inverse of the distances raised to power 
+parameter $p$. Parameters in IDW include the power parameter, the maximum number of observations $n$ to use,
+the maximum distance of observations to use, and the minimum number of nearest observations 
+less than the maximum distance required to generate a prediction.
+
+The `gstat` package has functions for performing IDW interpolation. We'll consider an example with 
+10 neighbors and a power parameter of 2 (so inverse squared distance).
+
+
+```{r method_idw, results = "hide"}
+wa_region_idw <- gstat(
+  formula = log(prcp) ~ 1, 
+  data = stations_wa_region, 
+  set = list(idp = 2),
+  nmax = 10
+)
+
+wa_region_grid_pred_idw <- wa_region_grid %>%
+  mutate(prcp = exp(predict(wa_region_idw, st_centroid(wa_region_grid))$var1.pred))
+```
+
+```{r method_idw_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_idw) %>%
+  add_prcp_legend()
+```
+
+Inverse distance weighting typically produces a characteristic artifact in the form
+of noticeable local maxima and minima at observed points.
+
+## Ordinary kriging
+
+Finally, we look at [kriging](https://en.wikipedia.org/wiki/Kriging),
+a statistical method for interpolation that makes assumptions
+about the covariance of the random process.
+
+We will perform ordinary kriging, in which we assume there is a constant unknown mean.
+
+First we will compute the sample variogram and fit a variogram model. We will use a Gaussian
+covariance model.
+
+```{r method_kriging_vario}
+wa_region_variogram <- variogram(log(prcp) ~ 1, stations_wa_region)
+wa_region_vario_fit = fit.variogram(
+  wa_region_variogram, 
+  model = vgm(
+    psill = max(wa_region_variogram$gamma),
+    model = "Gau",
+    range = max(wa_region_variogram$dist),
+    nugget = mean(wa_region_variogram$gamma) / 5
+  )
+)
+```
+
+Let's see the sample variogram and fitted variogram model.
+
+```{r method_kriging_vario_plot}
+plot(wa_region_variogram, wa_region_vario_fit)
+```
+
+Now let's use this variogram model to perform kriging.
+
+```{r method_kriging_predict, results = "hide"}
+wa_region_krige <- krige(
+  log(prcp) ~ 1, 
+  stations_wa_region,  
+  st_centroid(wa_region_grid), 
+  model = wa_region_vario_fit
+)
+
+wa_region_grid_pred_kriging <- wa_region_grid %>%
+  mutate(prcp = exp(wa_region_krige$var1.pred))
+```
+
+```{r method_kriging_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_kriging) %>%
+  add_prcp_legend()
+```
+
+You can see more examples on spatial interpolation in
+[this chapter on interpolation](https://rspatial.org/raster/analysis/4-interpolation.html)
+in an [RSpatial](https://rspatial.org/) guide.
+
+## Compare all methods for example
+
+Let's view the results for the predictions from all six of these models on a single map.
+
+```{r method_compare_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(wa_region_grid_pred_voronoi, group = "Nearest neighbor") %>%
+  add_prcp_poly(wa_region_grid_pred_triangle, group = "Triangulation") %>%
+  add_prcp_poly(wa_region_grid_pred_nat_nbr, group = "Natural neighbor") %>%
+  add_prcp_poly(wa_region_grid_pred_tps, group = "Thin plate spline") %>%
+  add_prcp_poly(wa_region_grid_pred_idw, group = "Inverse distance weighting") %>%
+  add_prcp_poly(wa_region_grid_pred_kriging, group = "Ordinary kriging") %>%
+  add_prcp_legend() %>%
+  addLayersControl(
+    baseGroups = c(
+      "Nearest neighbor",
+      "Triangulation",
+      "Natural neighbor", 
+      "Thin plate spline",
+      "Inverse distance weighting",
+      "Ordinary kriging"
+    ), 
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
+
+## Interpolating to ZCTA polygons
+
+Once we have interpolated to the hexagonal grid, we then interpolate to ZCTA polygons
+by a simple area-weighted interpolation.
+
+Let's see an example for the nearest neighbor predictions on our example region.
+
+First we get intersections between ZCTAs and the hexagonal grid. Then we compute the
+area of each intersecting polygon, and within each ZCTA, we compute 
+precipitation as an area-weighted average of the hexagonal grid cells
+intersecting with that ZCTA.
+
+```{r method_interpolate_zcta}
+wa_region_zcta_voronoi <- st_intersection(wa_region_zcta, wa_region_grid_pred_voronoi) %>%
+  mutate(area = st_area(.)) %>%
+  st_set_geometry(NULL) %>%
+  mutate(area = units::set_units(area, NULL)) %>%
+  group_by(zcta) %>%
+  summarise(prcp = sum(prcp * area) / sum(area))
+```
+
+Here is the resulting ZCTA precipitation map for the example region 
+for the nearest neighbor interpolation.
+
+```{r method_interpolate_zcta_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  add_prcp_poly(left_join(wa_region_zcta, wa_region_zcta_voronoi, by = "zcta"))
+```
+
+# Comparing method accuracy
+
+```{r compare_clean, include = FALSE}
+rm(list = setdiff(ls(), c("stations", "add_prcp_legend", "prcp_pal")))
+```
+
+## Data for method comparison
+
+We now want to do a comparison of the prediction accuracy among the different interpolation 
+methods. For this part, we will consider a larger region: states in the continental
+United States west of the Mississippi River (Washington, Oregon, California, 
+Arizona, Nevada, Utah, Idaho, Montana, Wyoming, Colorado, New Mexico, Texas,
+Oklahoma, Kansas, Nebraska, South Dakota, North Dakota, Minnesota, Iowa,
+Missouri, Arkansas, Louisiana).
+
+```{r compare_states}
+states <- c(
+  "WA", "OR", "CA", "AZ", "NV", "UT", "ID", "MT", "WY", "CO", "NM", 
+  "TX", "OK", "KS", "NE", "SD", "ND", "MN", "IA", "MO", "AR", "LA"
+)
+
+stations_compare <- stations %>%
+  filter(state %in% states) %>%
+  distinct(geometry, .keep_all = TRUE)
+```
+
+Let's see a map of rainfall at the set of stations in our testing data set.
+
+
+```{r compare_states_map}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    data = st_transform(stations_compare, 4326),
+    weight = 0.5,
+    fillColor = ~prcp_pal(pmin(prcp, 100)),
+    color = ~prcp_pal(pmin(prcp, 100)),
+    fillOpacity = 0.6,
+    radius = 3
+  ) %>%
+  add_prcp_legend()
+```
+
+There are `r formatC(nrow(stations_compare), digits = 0, big.mark = ",", format = "f")` stations in this region. 
+
+Note that precipitation is right-skewed.
+
+```{r compare_prcp_hist}
+ggplot(data = stations_compare) + 
+  theme_minimal() + 
+  geom_histogram(aes(x = prcp), binwidth = 1) +
+  theme(axis.title = element_blank()) + 
+  ggtitle("Histogram of inches of precipitation at stations in test region")
+```
+
+We will use the log of precipitation as our response variable.
+
+```{r compare_prcp_log_hist}
+ggplot(data = stations_compare) + 
+  theme_minimal() + 
+  geom_histogram(aes(x = log(prcp)), binwidth = 0.1) +
+  theme(axis.title = element_blank()) + 
+  ggtitle("Histogram of log of precipitation at stations in test region")
+```
+
+
+## Running models with cross-validation
+
+For each method will get 10-fold cross-validation predictions of the log of
+precipitation. For the inverse distance weighting, we will try to optimize over
+the power parameter for different maximum numbers of neighbors, and for kriging, 
+we will try a few different covariance structures.
+
+We will compare the RMSE of the cross-validated predictions.
+
+```{r compare_data}
+set.seed(256)
+station_data <- stations_compare %>%
+  mutate(
+    prcp_log = log(prcp),
+    fold = sample.int(10, size = nrow(.), replace = TRUE)
+  )
+```
+
+In the following expandable chunk we have defined a function for each
+of the six methods that will take as inputs a data frame on which to fit
+a model and a data frame on which to predict from the fitted model.
+It will return the data frame on which to predict with a column of the
+predicted values.
+
+```{r compare_cv_method_fn, class.source = "fold-hide"}
+cv_fold_nearest_nbr <- function(fit_data, predict_data) {
+  fit_voronoi <- fit_data %>%
+    st_geometry() %>%
+    st_union() %>%
+    st_voronoi() %>%
+    st_collection_extract("POLYGON") %>%
+    st_as_sf() %>%
+    st_join(fit_data)
+  
+  predict_data %>%
+    st_join(fit_voronoi %>% select(predict = prcp_log)) %>%
+    st_set_geometry(NULL) %>%
+    as_tibble() %>%
+    transmute(id, fold, prcp_log, predict, method = "Nearest neighbor")
+}
+
+cv_fold_triangulate <- function(fit_data, predict_data) {
+  fit_triangulate <- fit_data %>%
+    st_geometry() %>%
+    st_union() %>%
+    st_triangulate() %>%
+    st_collection_extract("POLYGON") %>%
+    st_as_sf() %>%
+    rename(geometry = x)
+  
+  fit_coord_prcp <- fit_data %>%
+    bind_cols(as_tibble(st_coordinates(.))) %>%
+    st_set_geometry(NULL) %>%
+    as_tibble() %>%
+    select(X, Y, prcp_log)
+  
+  fit_triangle_values <- fit_triangulate %>%
+    st_coordinates() %>%
+    as_tibble() %>%
+    distinct(row = L2, X, Y) %>%
+    group_by(row) %>%
+    mutate(point = 1:n()) %>%
+    ungroup() %>%
+    left_join(fit_coord_prcp, by = c("X", "Y")) %>%
+    tidyr::pivot_wider(
+      names_from = point,
+      values_from = c(X, Y, prcp_log), 
+      names_glue = "pt{point}_{.value}"
+    )
+  
+  fit_triangulate_prcp <- bind_cols(fit_triangulate, fit_triangle_values)
+  
+  pred_triangles <- predict_data %>%
+    st_centroid() %>%
+    st_join(fit_triangulate_prcp) %>%
+    bind_cols(
+      st_coordinates(.) %>%
+        as_tibble() %>%
+        rename(cell_X = X, cell_Y = Y)
+    )
+  
+  pred_triangle_int <- pred_triangles %>%
+    mutate(
+      pt1_wt = ((pt2_Y - pt3_Y) * (cell_X - pt3_X) + (pt3_X - pt2_X) * (cell_Y - pt3_Y)) /
+        ((pt2_Y - pt3_Y) * (pt1_X - pt3_X) + (pt3_X - pt2_X) * (pt1_Y - pt3_Y)),
+      pt2_wt = ((pt3_Y - pt1_Y) * (cell_X - pt3_X) + (pt1_X - pt3_X) * (cell_Y - pt3_Y)) /
+        ((pt2_Y - pt3_Y) * (pt1_X - pt3_X) + (pt3_X - pt2_X) * (pt1_Y - pt3_Y)),
+      pt3_wt = 1 - pt1_wt - pt2_wt,
+      predict = pt1_wt * pt1_prcp_log + pt2_wt * pt2_prcp_log + pt3_wt * pt3_prcp_log
+    )
+  
+  pred_voronoi <- cv_fold_nearest_nbr(fit_data, predict_data)
+  
+  pred_triangle_int %>%
+    st_set_geometry(NULL) %>% 
+    as_tibble() %>%
+    left_join(pred_voronoi %>% select(id, pred_voronoi = predict), by = "id") %>%
+    transmute(
+      id, 
+      fold, 
+      prcp_log, 
+      predict = coalesce(predict, pred_voronoi),
+      method = "Triangulation"
+    )
+}
+
+cv_fold_natural_nbr <- function(fit_data, predict_data) {
+  proc <- purrr::map(
+    predict_data %>% 
+      group_split(0:(n() - 1) %% 8, keep = FALSE),
+    function(predict_data, fit_data) {
+      callr::r_bg(
+        function(predict_data, fit_data) {
+          library(dplyr)
+          library(sf)
+          
+          get_nat_nbr_int <- function(predict_pt, fit_data, fit_voronoi) {
+            voronoi_close <- fit_data %>%
+              filter(as.numeric(st_distance(., predict_pt)) <= 200) %>%
+              bind_rows(predict_pt) %>%
+              st_geometry() %>%
+              st_union() %>%
+              st_voronoi() %>%
+              st_collection_extract("POLYGON") %>%
+              st_as_sf() 
+            
+            voronoi_intersect <- voronoi_close %>%
+              st_join(predict_pt %>% select(geometry), left = FALSE) %>%
+              st_intersection(fit_voronoi) %>%
+              mutate(area = units::set_units(st_area(.), NULL))
+            
+            voronoi_intersect %>%
+              st_set_geometry(NULL) %>%
+              summarise(predict = sum(area * prcp_log) / sum(area))
+          }
+          fit_voronoi <- fit_data %>%
+            st_geometry() %>%
+            st_union() %>%
+            st_voronoi() %>%
+            st_collection_extract("POLYGON") %>%
+            st_as_sf() %>%
+            st_join(fit_data)
+          predict_data %>%
+            select(id, fold, prcp_log) %>%
+            purrrlyr::by_row(
+              get_nat_nbr_int,
+              fit_data = fit_data, 
+              fit_voronoi = fit_voronoi, 
+              .to = "interpolated"
+            ) %>%
+            tidyr::unnest_wider(interpolated)
+        },
+        args = list(predict_data = predict_data, fit_data = fit_data)
+      )
+    },
+    fit_data = fit_data
+  )
+  
+  purrr::walk(proc, ~.$wait())
+  
+  purrr::map_dfr(proc, ~.$get_result()) %>%
+    transmute(id, fold, prcp_log, predict, method = "Natural neighbor")
+}
+
+cv_fold_tps <- function(fit_data, predict_data) {
+  fit_tps <- fields::Tps(st_coordinates(fit_data), fit_data$prcp_log)
+  predict_data %>%
+    st_set_geometry(NULL) %>%
+    as_tibble() %>%
+    select(id, fold, prcp_log) %>%
+    mutate(
+      predict = predict(fit_tps, st_coordinates(st_centroid(predict_data)))[, 1],
+      method = "Thin plate spline"
+    )
+}
+
+cv_fold_idw <- function(fit_data, predict_data, power, nmax) {
+  fit_idw <- gstat(
+    formula = prcp_log ~ 1, 
+    data = fit_data, 
+    set = list(idp = power),
+    nmax = nmax
+  )
+  
+  predict_data %>%
+    st_set_geometry(NULL) %>%
+    as_tibble() %>%
+    select(id, fold, prcp_log) %>%
+    mutate(
+      predict = predict(fit_idw, st_centroid(predict_data), debug.level = 0)$var1.pred,
+      method = glue::glue("IDW (power {round(power, 3)}, nmax {nmax})")
+    )
+}
+
+idw_rmse <- function(power, data, nmax) {
+  cv_pred <- purrr::map_dfr(
+    1:10, 
+    function(fold_num) {
+      fit_data <- filter(data, fold != fold_num)
+      predict_data <- filter(data, fold == fold_num)
+      cv_fold_idw(fit_data, predict_data, power = power, nmax = nmax)
+    }
+  )
+  yardstick::rmse_vec(cv_pred$prcp_log, cv_pred$predict)
+}
+
+cv_fold_kriging <- function(fit_data, predict_data, model, kappa = 0.5) {
+  variogram <- variogram(prcp_log ~ 1, fit_data)
+  variogram_fit = fit.variogram(
+    variogram, 
+    model = vgm(
+      psill = max(variogram$gamma),
+      model = model,
+      range = max(variogram$dist),
+      nugget = mean(variogram$gamma) / 5,
+      kappa = kappa
+    )
+  )
+  
+  predicted <- krige(
+    prcp_log ~ 1, 
+    fit_data,  
+    predict_data, 
+    model = variogram_fit,
+    debug.level = 0
+  )
+  
+  model_desc <- if (model == "Mat") glue::glue("Mat, kappa = {round(kappa, 2)}") else model
+  
+  predict_data %>%
+    st_set_geometry(NULL) %>%
+    as_tibble() %>%
+    select(id, fold, prcp_log) %>%
+    mutate(
+      predict = predicted$var1.pred,
+      method = glue::glue("Ordinary kriging (model {model_desc})")
+    )
+}
+```
+
+
+We will invoke these functions from `get_cv_pred`. Across the 10 folds,
+we will use the functions defined in the preceding chunk to get cross-validated
+predictions. The function to use for a specific method is passed
+as the argument `cv_fold_fn`. The dots are additional arguments passed
+to `cv_fold_fn`.
+
+```{r, compare_cv_pred_fn, class.source = "fold-show"}
+get_cv_pred <- function(data, cv_fold_fn, ...) {
+  purrr::map_dfr(
+    1:10, 
+    function(fold_num) {
+      fit_data <- filter(data, fold != fold_num)
+      predict_data <- filter(data, fold == fold_num)
+      cv_fold_fn(fit_data, predict_data, ...)
+    }
+  )
+}
+```
+
+First, for the inverse distance weighting method,
+we will optimize the power parameter for a few different choices
+of `nmax`, the maximum number of neighbors. For each of a few
+choices of `nmax`, we will use `optimize`, to try to find the value
+of the power parameter with the lowest RMSE of 10-fold cross-validated
+predictions.
+
+```{r compare_idw_optimize}
+idw_methods <- tibble(
+  cv_fold_fn = list(cv_fold_idw),
+  nmax = c(2, 5, 10, 15, 20, 50)
+) %>%
+  mutate(
+    power = purrr::map_dbl(
+      nmax, ~optimize(idw_rmse, c(0.1, 5), nmax = ., data = station_data)$minimum
+    )
+  ) %>%
+  purrr::transpose()
+```
+
+
+We will also try the other methods we reviewed earlier: nearest neighbor,
+triangulation, natural neighbor, thin plate spline, and ordinary kriging.
+With kriging, we will consider a few different covariance structures:
+spherical, exponential, Gaussian, and Matern, with a few different values of the
+kappa smooothness parameter (0.3, 0.5, and 0.7) for the Matern covariance.
+
+```{r compare_methods_list}
+other_methods <- list(
+  list(cv_fold_fn = cv_fold_nearest_nbr),
+  list(cv_fold_fn = cv_fold_triangulate),
+  list(cv_fold_fn = cv_fold_natural_nbr),
+  list(cv_fold_fn = cv_fold_tps),
+  list(cv_fold_fn = cv_fold_kriging, model = "Sph"),
+  list(cv_fold_fn = cv_fold_kriging, model = "Exp"),
+  list(cv_fold_fn = cv_fold_kriging, model = "Gau"),
+  list(cv_fold_fn = cv_fold_kriging, model = "Mat", kappa = 0.3),
+  list(cv_fold_fn = cv_fold_kriging, model = "Mat", kappa = 0.5),
+  list(cv_fold_fn = cv_fold_kriging, model = "Mat", kappa = 0.7)
+) 
+
+all_methods <- c(other_methods, idw_methods)
+```
+
+Now we will invoke the `get_cv_pred` across all the combinations of models to
+get a data frame containing cross-validated predictions.
+
+```{r compare_cv_pred_result}
+method_cv_pred <- purrr::map_dfr(
+  all_methods, 
+  purrr::lift_dl(get_cv_pred), 
+  data = station_data
+)
+```
+
+## Table of results
+
+The following table shows the RMSE on 10-fold cross-validated predictions for
+each of the different methods.
+
+```{r compare_table}
+method_cv_pred %>%
+  group_by(method) %>%
+  yardstick::rmse(prcp_log, predict) %>%
+  arrange(.estimate) %>%
+  select(method, rmse = .estimate) %>%
+  gt::gt() %>%
+  gt::fmt_number(decimals = 5, vars(rmse)) %>%
+  gt::cols_align(align = "left", columns = vars(method))
+```
+
+<br>
+
+We see that the natural neighbor performed best, followed closely by the 
+thin plate spline and triangulation methods.
+
+The optimized inverse distance weighting models followed behind, with maximum
+numbers of neighbors of 10 and 15 edging out the others. 
+
+The kriging models did not perform as well on this data. The Matern
+covariance structure with the smallest value of kappa performed the best out of the
+kriging models tested. This was competitive with the IDW models. Other kriging models trailed, with the Gaussian covariance performing the
+worst of any model tested. 
+
+As expected, the simple nearest neighbor model was notably outperformed by the likes
+of the natural neighbor, thin plate spline, and triangulation models.
+
