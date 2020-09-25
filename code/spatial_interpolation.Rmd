@@ -551,15 +551,15 @@ leaflet() %>%
     color = "red", 
     weight = 1, 
     fillOpacity = 0.5,
-    label = "Kirkland",
+    label = "Carnation",
     labelOptions = labelOptions(textsize = "14px")
   )
 ```
 
-To interpolate a value for Auburn, we first calculate the areas of the 
-intersections between the Auburn polygon and all the original polygons with which 
-the Auburn polygon intersects. For illustration, we will also calculate the weight
-as the ratio of the intersection area to the total area of the Auburn polygon.
+To interpolate a value for Carnation, we first calculate the areas of the 
+intersections between the Carnation polygon and all the original polygons with which 
+the Carnation polygon intersects. For illustration, we will also calculate the weight
+as the ratio of the intersection area to the total area of the Carnation polygon.
 
 ```{r method_natnbr_carnation_calc_1}
 carnation_poly %>%
@@ -571,7 +571,7 @@ carnation_poly %>%
   )
 ```
 
-Finally, we calculated the interpolated precipitation for Auburn as the
+Finally, we calculated the interpolated precipitation for Carnation as the
 area-weighted precipitation of the intersecting polygons.
 
 ```{r method_natnbr_carnation_calc_2}
