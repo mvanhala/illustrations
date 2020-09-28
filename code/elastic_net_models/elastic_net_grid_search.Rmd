@@ -29,7 +29,7 @@ combination of the $L_1$ (lasso) and $L_2$ (ridge regression) penalties.
 The elastic net penalty is of the form
 
 $$
-\alpha \ell_1 + (1 - \alpha) \ell_1
+\alpha \ell_1 + (1 - \alpha) \ell_2
 $$
 where $\ell_1$ is the $L_1$ penalty and $\ell_2$ is the $L_2$ penalty. Hence the lasso and ridge
 regression are special cases of the elastic net penalty. In particular, $\alpha = 1$ corresponds
