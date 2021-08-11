@@ -153,6 +153,12 @@ fit_models <- function(pol_data, claim_data, deductibles) {
       family = tweedie(var.power = 1.5, link.power = 0),
       data = pol_data_model
     ),
+    "Loss net of deductible, ground-up", "None",
+    glm(
+      loss_net_ded_gu ~ x1 + x2, 
+      family = tweedie(var.power = 1.5, link.power = 0),
+      data = pol_data_model
+    ),
     "Loss net of deductible, ground-up", "Count elimination ratio",
     glm(
       loss_net_ded_gu ~ x1 + x2 + offset(log(cnt_ratio)), 
