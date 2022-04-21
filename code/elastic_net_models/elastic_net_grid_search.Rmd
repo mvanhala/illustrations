@@ -282,7 +282,7 @@ use at each alpha.
 
 For each alpha value, we will get a sequence of the number of specified lambdas
 which is evenly spaced on the log scale, going from the lambda min ratio times
-$\lambda_\max$ to $\lambda_max$ (where $\lambda_\max$ is for that specific alpha value).
+$\lambda_\max$ to $\lambda_\max$ (where $\lambda_\max$ is for that specific alpha value).
 
 ```{r grid}
 grid_params <- tibble(

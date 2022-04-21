@@ -551,7 +551,7 @@ plot_dist_curve(
   sim_dist_curve, 
   tgt_col = "cum_pct_tgt", 
   wgt_col = "cum_pct_pred", 
-  title = "Distribution comparison curve for sample FP model"
+  title = "Distribution comparison curve for sample model"
 ) +
   xlab("Cumulative % predicted loss") + 
   ylab("Cumulative % actual loss")
